@@ -80,39 +80,63 @@ cargo build                    # → target/debug/bughouse_engine
 # Build (release — optimised, no debug symbols)
 cargo build --release          # → target/release/bughouse_engine
 
-# Run the stub directly (currently just prints "Hello, world!")
+# Run interactively (type BUP commands, Ctrl-D to exit)
 cargo run
 
-# Test
+# Test (46 unit tests covering protocol parsing, state management, move generation)
 cargo test
 ```
 
 The engine binary communicates over **stdin/stdout** only. It is not a server — it is spawned as a child process by the Elixir Port wrapper (Layer 2). To test it manually you can pipe commands into it:
 
 ```bash
-echo -e "bup\nquit" | ./target/debug/bughouse_engine
+echo -e "bup\nisready\nbupnewgame\nposition board A startpos\ngo board A\nquit" \
+  | ./target/debug/bughouse_engine
+```
+
+Example output:
+
+```
+id name BughouseEngine 0.1.0
+id author Viren Sawant
+bupok
+readyok
+info board A depth 0 nodes 20 time 0 score cp 0
+bestmove board A e2e4
+```
+
+With reserves (drops available):
+
+```bash
+echo -e "bup\nbupnewgame\nposition board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1\ngo board A\nquit" \
+  | ./target/debug/bughouse_engine
+```
+
+```
+id name BughouseEngine 0.1.0
+id author Viren Sawant
+bupok
+info board A depth 0 nodes 116 time 0 score cp 0
+bestmove board A n@c3
 ```
 
 ---
 
-## Planned source layout
-
-The engine will grow into this module structure inside `src/`:
+## Source layout
 
 ```
 src/
-├── main.rs          # Entry point: BUP I/O loop (read line → dispatch → write line)
-├── bup.rs           # BUP protocol parser & formatter
-├── bfen.rs          # BFEN parser & emitter
-├── board.rs         # Bitboard board state (u64 per piece type × colour)
-├── moves.rs         # Move generation (pseudo-legal + legality filter)
-├── search.rs        # Tree search (minimax/alpha-beta or MCTS)
-├── scoring.rs       # Static evaluation function (material, position, ...)
-├── bughouse.rs      # Bughouse-specific logic: drops, reserve tracking, demotion
-└── time.rs          # Clock management: time allocation per move
+├── main.rs          # Thin I/O loop: stdin → parse → dispatch → format → stdout
+├── bup.rs           # BUP protocol parser & formatter (pure data, no I/O)
+└── game_state.rs    # EngineState + command dispatch → responses (no I/O)
 ```
 
-Each module has a single responsibility. The dependency graph flows top-down: `main` → `bup` → `bfen`/`board` → `moves` → `search`/`scoring`. `bughouse` is a cross-cutting concern that touches `board`, `moves`, and `scoring`.
+Board representation, move generation, BFEN parsing, and drop logic all live in the [bughouse-chess](https://github.com/vcsawant/bughouse-chess) library. The engine is deliberately thin — it wires protocol parsing to the library's game logic.
+
+Future phases will add:
+- `search.rs` — tree search (minimax/alpha-beta or MCTS)
+- `scoring.rs` — static evaluation function (material, position, reserves)
+- `time.rs` — clock management and time allocation per move
 
 ---
 
@@ -120,17 +144,16 @@ Each module has a single responsibility. The dependency graph flows top-down: `m
 
 Development proceeds in four phases, each building on the last:
 
-### Phase B — Random-move bot (current)
+### Phase B — Random-move bot (complete)
 
-The minimum viable engine. Parses BUP commands, maintains board state via BFEN, generates all legal moves, picks one at random, and returns `bestmove`. This validates the entire plumbing: Rust binary ↔ Elixir Port ↔ BUP protocol ↔ BFEN parsing ↔ move generation.
+The minimum viable engine. Parses BUP commands, maintains board state via BFEN, generates all legal moves (regular + drops), picks one at random, and returns `bestmove`. This validates the entire plumbing: Rust binary ↔ Elixir Port ↔ BUP protocol ↔ BFEN parsing ↔ move generation.
 
-**Deliverables:**
-- `bup.rs` — full handshake + command dispatch
-- `bfen.rs` — parse and emit spec-compliant BFEN (including `~` and `[]`)
-- `board.rs` — bitboard representation, FEN ↔ board conversion
-- `moves.rs` — pseudo-legal move gen + legality filter (king not left in check)
-- `bughouse.rs` — drop move generation from reserves
-- `main.rs` — I/O loop that ties it all together
+**Implemented:**
+- `bup.rs` — BUP protocol parser & formatter (28 unit tests)
+- `game_state.rs` — engine state, command dispatch, random move selection (18 unit tests)
+- `main.rs` — thin I/O loop with BufWriter for efficient stdout
+- Full BUP handshake (`bup`/`bupok`), position setup (`startpos` / `bfen`), clock tracking, `go` / `stop` / `quit`
+- Drop moves from reserves with BUP-compliant lowercase notation (`p@e4`, `n@f3`)
 
 ### Phase C — Basic heuristics
 
@@ -170,11 +193,31 @@ During development, binbo validates every move this engine suggests. This two-en
 
 ---
 
+## Dependencies
+
+### bughouse-chess
+
+The engine uses [bughouse-chess](https://github.com/vcsawant/bughouse-chess) — a Rust move generation library forked from [jordanbray/chess](https://github.com/jordanbray/chess) and adapted for bughouse rules. It provides:
+
+- Bitboard-based board representation with reserves and promoted-piece tracking
+- Legal move generation (all piece moves + castling, no check/pin filtering per bughouse rules)
+- Drop move generation from reserves (pawn rank restrictions enforced)
+- BFEN parsing and emission (reserves in `[]` brackets, promoted pieces with `~` suffix)
+- Capture tracking with promoted-piece demotion
+- Zobrist hashing that includes reserve state
+
+The library is linked via `Cargo.toml`:
+```toml
+[dependencies]
+bughouse-chess = { git = "https://github.com/vcsawant/bughouse-chess", branch = "main" }
+```
+
 ## Tech notes
 
 | Topic | Detail |
 |-------|--------|
 | Rust edition | 2024 |
+| Chess library | `bughouse-chess` v0.1.0 (git dependency from GitHub) |
 | Target | `aarch64-apple-darwin` (Apple Silicon) |
 | Bitboard width | 64-bit (`u64`) — one per piece-type × colour |
 | Protocol | Line-based stdin/stdout (no network sockets) |
