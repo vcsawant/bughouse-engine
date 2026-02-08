@@ -52,6 +52,7 @@ pub enum BupResponse {
     ReadyOk,
     Info { board: BoardId, depth: u32, nodes: usize, time_ms: u64, score_cp: i32 },
     BestMove { board: BoardId, move_str: String },
+    TeamMsg(String),
 }
 
 // ─── Parsing ─────────────────────────────────────────────────────────
@@ -204,6 +205,7 @@ pub fn format_response(resp: &BupResponse) -> String {
             let board_str = match board { BoardId::A => "A", BoardId::B => "B" };
             format!("bestmove board {} {}", board_str, move_str)
         }
+        BupResponse::TeamMsg(msg) => format!("teammsg {}", msg),
     }
 }
 

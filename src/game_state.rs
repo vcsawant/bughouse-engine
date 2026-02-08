@@ -187,7 +187,28 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
         state.game_id, board_id, combined.len(), num_regular, num_drops, chosen_str, elapsed_ms
     );
 
+    // Send a random team message before the best move (for testing bot→human comms)
+    let team_msgs = [
+        "need n urgency high",
+        "need q urgency medium",
+        "need b",
+        "need r urgency low",
+        "need p",
+        "stall",
+        "stall duration 2",
+        "play_fast reason time",
+        "play_fast reason pressure",
+        "threat critical",
+        "threat high",
+        "threat medium",
+        "threat low",
+        "material +100",
+        "material -50",
+    ];
+    let random_msg = team_msgs.choose(&mut state.rng).unwrap();
+
     vec![
+        BupResponse::TeamMsg(random_msg.to_string()),
         BupResponse::Info {
             board: board_id,
             depth: 0,
@@ -331,15 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn go_produces_info_and_bestmove() {
+    fn go_produces_teammsg_info_and_bestmove() {
         let mut state = new_state();
         process_command(&mut state, &BupCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
         let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
-        assert_eq!(resp.len(), 2);
-        assert!(matches!(&resp[0], BupResponse::Info { board: BoardId::A, .. }));
-        assert!(matches!(&resp[1], BupResponse::BestMove { board: BoardId::A, .. }));
+        assert_eq!(resp.len(), 3);
+        assert!(matches!(&resp[0], BupResponse::TeamMsg(_)));
+        assert!(matches!(&resp[1], BupResponse::Info { board: BoardId::A, .. }));
+        assert!(matches!(&resp[2], BupResponse::BestMove { board: BoardId::A, .. }));
     }
 
     #[test]
@@ -349,7 +371,7 @@ mod tests {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
         let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
-        let move_str = match &resp[1] {
+        let move_str = match &resp[2] {
             BupResponse::BestMove { move_str, .. } => move_str.clone(),
             _ => panic!("expected BestMove"),
         };
@@ -389,7 +411,7 @@ mod tests {
         // Starting position has 20 regular moves. With a knight in reserve,
         // the knight can drop on all empty squares (32 squares in middle 4 ranks).
         // Total should be > 20
-        if let BupResponse::Info { nodes, .. } = &resp[0] {
+        if let BupResponse::Info { nodes, .. } = &resp[1] {
             assert!(*nodes > 20, "expected drops to increase node count, got {}", nodes);
         } else {
             panic!("expected Info response");
@@ -404,7 +426,7 @@ mod tests {
         });
         let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
         // Starting position: 20 regular moves, 0 drops (empty reserves)
-        if let BupResponse::Info { nodes, .. } = &resp[0] {
+        if let BupResponse::Info { nodes, .. } = &resp[1] {
             assert_eq!(*nodes, 20);
         } else {
             panic!("expected Info response");
@@ -471,15 +493,17 @@ mod tests {
 
         // Go on board A
         let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
-        assert_eq!(resp.len(), 2);
-        assert!(matches!(&resp[0], BupResponse::Info { board: BoardId::A, .. }));
-        assert!(matches!(&resp[1], BupResponse::BestMove { board: BoardId::A, .. }));
+        assert_eq!(resp.len(), 3);
+        assert!(matches!(&resp[0], BupResponse::TeamMsg(_)));
+        assert!(matches!(&resp[1], BupResponse::Info { board: BoardId::A, .. }));
+        assert!(matches!(&resp[2], BupResponse::BestMove { board: BoardId::A, .. }));
 
         // Go on board B
         let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::B });
-        assert_eq!(resp.len(), 2);
-        assert!(matches!(&resp[0], BupResponse::Info { board: BoardId::B, .. }));
-        assert!(matches!(&resp[1], BupResponse::BestMove { board: BoardId::B, .. }));
+        assert_eq!(resp.len(), 3);
+        assert!(matches!(&resp[0], BupResponse::TeamMsg(_)));
+        assert!(matches!(&resp[1], BupResponse::Info { board: BoardId::B, .. }));
+        assert!(matches!(&resp[2], BupResponse::BestMove { board: BoardId::B, .. }));
 
         // Quit
         let resp = process_command(&mut state, &BupCommand::Quit);
@@ -495,7 +519,7 @@ mod tests {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
         let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
-        if let BupResponse::BestMove { move_str, .. } = &resp[1] {
+        if let BupResponse::BestMove { move_str, .. } = &resp[2] {
             // Regular UCI move: 4 chars like "e2e4" or 5 for promotion "e7e8q"
             assert!(move_str.len() >= 4, "move too short: {}", move_str);
             // Should not contain '@' (no reserves in starting position)
@@ -515,7 +539,7 @@ mod tests {
         let mut found_drop = false;
         for _ in 0..50 {
             let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::B });
-            if let BupResponse::BestMove { move_str, .. } = &resp[1] {
+            if let BupResponse::BestMove { move_str, .. } = &resp[2] {
                 if move_str.contains('@') {
                     // Drop format: lowercase piece letter + @ + square
                     assert_eq!(move_str.as_bytes()[0], b'q', "expected lowercase q, got {}", move_str);
