@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use bughouse_chess::{Board, BughouseMove, MoveGen};
+use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 
 use crate::bup::{BoardId, BupCommand, BupResponse, ClockTarget, PositionSpec, format_move};
@@ -17,14 +18,16 @@ pub struct EngineState {
     boards: [Option<Board>; 2],
     clocks: [u64; 4],  // white_A=0, black_A=1, white_B=2, black_B=3
     rng: rand::rngs::ThreadRng,
+    pub game_id: String,
 }
 
 impl EngineState {
-    pub fn new() -> Self {
+    pub fn new(game_id: String) -> Self {
         EngineState {
             boards: [None, None],
             clocks: [0; 4],
             rng: rand::thread_rng(),
+            game_id,
         }
     }
 
@@ -72,6 +75,7 @@ pub fn process_command(state: &mut EngineState, cmd: &BupCommand) -> Vec<BupResp
         BupCommand::IsReady => vec![BupResponse::ReadyOk],
 
         BupCommand::BupNewGame => {
+            info!("[game:{}] New game — state reset", state.game_id);
             state.reset();
             vec![]
         }
@@ -95,7 +99,7 @@ pub fn process_command(state: &mut EngineState, cmd: &BupCommand) -> Vec<BupResp
         BupCommand::Quit => vec![],
 
         BupCommand::Unknown(line) => {
-            eprintln!("bughouse-engine: unknown command: {}", line);
+            warn!("[game:{}] Unknown command: {}", state.game_id, line);
             vec![]
         }
     }
@@ -105,11 +109,17 @@ pub fn process_command(state: &mut EngineState, cmd: &BupCommand) -> Vec<BupResp
 
 fn handle_position(state: &mut EngineState, board_id: BoardId, fen: &PositionSpec, moves: &[String]) {
     let mut board = match fen {
-        PositionSpec::StartPos => Board::default(),
+        PositionSpec::StartPos => {
+            debug!("[game:{}] Board {:?} set to startpos", state.game_id, board_id);
+            Board::default()
+        }
         PositionSpec::Bfen(s) => match s.parse::<Board>() {
-            Ok(b) => b,
+            Ok(b) => {
+                debug!("[game:{}] Board {:?} set from BFEN", state.game_id, board_id);
+                b
+            }
             Err(e) => {
-                eprintln!("bughouse-engine: invalid bfen: {}", e);
+                warn!("[game:{}] Invalid BFEN for board {:?}: {}", state.game_id, board_id, e);
                 return;
             }
         },
@@ -124,12 +134,12 @@ fn handle_position(state: &mut EngineState, board_id: BoardId, fen: &PositionSpe
                 match board.make_drop_new(piece, square) {
                     Some(new_board) => board = new_board,
                     None => {
-                        eprintln!("bughouse-engine: illegal drop: {}", move_str);
+                        warn!("[game:{}] Illegal drop: {}", state.game_id, move_str);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("bughouse-engine: invalid move '{}': {}", move_str, e);
+                warn!("[game:{}] Invalid move '{}': {}", state.game_id, move_str, e);
             }
         }
     }
@@ -143,7 +153,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
     let board = match &state.boards[board_index(board_id)] {
         Some(b) => b,
         None => {
-            eprintln!("bughouse-engine: go on unset board {:?}", board_id);
+            warn!("[game:{}] Go on unset board {:?}", state.game_id, board_id);
             return vec![];
         }
     };
@@ -156,17 +166,26 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
         .collect();
     let drop_moves = MoveGen::drop_moves(board);
 
-    let mut combined: Vec<BughouseMove> = Vec::with_capacity(regular_moves.len() + drop_moves.len());
+    let num_regular = regular_moves.len();
+    let num_drops = drop_moves.len();
+
+    let mut combined: Vec<BughouseMove> = Vec::with_capacity(num_regular + num_drops);
     combined.extend(regular_moves);
     combined.extend(drop_moves);
 
     if combined.is_empty() {
-        eprintln!("bughouse-engine: no legal moves on board {:?}", board_id);
+        warn!("[game:{}] No legal moves on board {:?}", state.game_id, board_id);
         return vec![];
     }
 
     let chosen = combined.choose(&mut state.rng).unwrap();
+    let chosen_str = format_move(chosen);
     let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    info!(
+        "[game:{}] Board {:?}: {} legal moves ({} regular + {} drops), chose {} in {}ms",
+        state.game_id, board_id, combined.len(), num_regular, num_drops, chosen_str, elapsed_ms
+    );
 
     vec![
         BupResponse::Info {
@@ -178,7 +197,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
         },
         BupResponse::BestMove {
             board: board_id,
-            move_str: format_move(chosen),
+            move_str: chosen_str,
         },
     ]
 }
@@ -193,7 +212,7 @@ mod tests {
     use std::str::FromStr;
 
     fn new_state() -> EngineState {
-        EngineState::new()
+        EngineState::new("test".to_string())
     }
 
     #[test]
