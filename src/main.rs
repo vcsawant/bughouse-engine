@@ -1,4 +1,4 @@
-mod bup;
+mod ubi;
 mod game_state;
 
 use std::io::{self, BufRead, BufWriter, Write};
@@ -8,11 +8,11 @@ use clap::Parser;
 use log::{info, warn};
 use simplelog::*;
 
-use bup::{parse_command, format_response, BupCommand};
+use ubi::{parse_command, format_response, UbiCommand};
 use game_state::{EngineState, process_command};
 
 #[derive(Parser)]
-#[command(name = "bughouse_engine", about = "Bughouse chess engine (BUP protocol)")]
+#[command(name = "bughouse_engine", about = "Bughouse chess engine (UBI protocol)")]
 struct Args {
     /// Path to log file. If omitted, no logging is performed.
     #[arg(long)]
@@ -73,7 +73,7 @@ fn main() {
             }
         };
 
-        let is_quit = matches!(cmd, BupCommand::Quit);
+        let is_quit = matches!(cmd, UbiCommand::Quit);
         let responses = process_command(&mut state, &cmd);
         for resp in &responses {
             let resp_line = format_response(resp);

@@ -1,8 +1,8 @@
-# BUP (Bughouse Universal Protocol) v0.1
+# UBI (Universal Bughouse Interface) v0.1
 
 ## Overview
 
-BUP (Bughouse Universal Protocol) is a text-based communication protocol for bughouse chess engines. It extends concepts from UCI (Universal Chess Interface) while addressing bughouse-specific requirements: dual boards, piece reserves, drop moves, and optional team coordination.
+UBI (Universal Bughouse Interface) is a text-based communication protocol for bughouse chess engines. It extends concepts from UCI (Universal Chess Interface) while addressing bughouse-specific requirements: dual boards, piece reserves, drop moves, and optional team coordination.
 
 **Design Philosophy:**
 - Position-agnostic engine design
@@ -53,28 +53,28 @@ This design makes engines simpler to implement and easier to test in isolation.
 
 ### Starting the Engine
 
-**GUI → Engine:** `bup`
+**GUI → Engine:** `ubi`
 
-Initiates BUP mode. Engine must respond with identification and capabilities.
+Initiates UBI mode. Engine must respond with identification and capabilities.
 
 **Engine → GUI Response:**
 ```
 id name <string>
 id author <string>
 [option <definition>]*
-bupok
+ubiok
 ```
 
 **Example:**
 ```
-GUI → Engine: bup
+GUI → Engine: ubi
 
 Engine → GUI: id name BughouseBot 1.0
 Engine → GUI: id author Alice Smith
 Engine → GUI: option name Hash type spin default 128 min 16 max 4096
 Engine → GUI: option name Threads type spin default 1 min 1 max 64
 Engine → GUI: option name TeamMessageMode type combo default consider var ignore var consider var full
-Engine → GUI: bupok
+Engine → GUI: ubiok
 ```
 
 ### Options
@@ -99,7 +99,7 @@ Engines can define custom options following UCI conventions:
 
 **GUI → Engine:** `setoption name <id> [value <x>]`
 
-Set engine parameters. Must be sent before `bupnewgame`.
+Set engine parameters. Must be sent before `ubinewgame`.
 
 **Examples:**
 ```
@@ -427,7 +427,7 @@ partnermsg play_fast reason time
 
 ### New Game
 
-**GUI → Engine:** `bupnewgame`
+**GUI → Engine:** `ubinewgame`
 
 Prepare for new game. Engine should:
 - Clear all hash tables
@@ -436,7 +436,7 @@ Prepare for new game. Engine should:
 
 **Example:**
 ```
-bupnewgame
+ubinewgame
 ```
 
 ### Ready Check
@@ -471,16 +471,16 @@ quit
 ### Example 1: Single Board Engine
 
 ```
-GUI → Engine: bup
+GUI → Engine: ubi
 Engine → GUI: id name SimpleBot 1.0
 Engine → GUI: id author Carol
 Engine → GUI: option name Hash type spin default 128 min 16 max 1024
 Engine → GUI: option name TeamMessageMode type combo default full var ignore var consider var full
-Engine → GUI: bupok
+Engine → GUI: ubiok
 
 GUI → Engine: setoption name Hash value 256
 GUI → Engine: setoption name TeamMessageMode value full
-GUI → Engine: bupnewgame
+GUI → Engine: ubinewgame
 GUI → Engine: isready
 Engine → GUI: readyok
 
@@ -526,16 +526,16 @@ GUI → Engine: quit
 ### Example 2: Dual-Board Engine
 
 ```
-GUI → Engine: bup
+GUI → Engine: ubi
 Engine → GUI: id name DualMaster 2.0
 Engine → GUI: id author Dave
 Engine → GUI: option name Hash type spin default 512 min 16 max 8192
 Engine → GUI: option name Threads type spin default 2 min 1 max 16
-Engine → GUI: bupok
+Engine → GUI: ubiok
 
 GUI → Engine: setoption name Hash value 1024
 GUI → Engine: setoption name Threads value 4
-GUI → Engine: bupnewgame
+GUI → Engine: ubinewgame
 GUI → Engine: isready
 Engine → GUI: readyok
 
@@ -745,7 +745,7 @@ Return best move found so far.
 
 ## 13. Differences from UCI
 
-| Feature | UCI | BUP |
+| Feature | UCI | UBI |
 |---------|-----|-----|
 | Board count | 1 | 2 (A and B) |
 | Notation | FEN | BFEN (with reserves) |
@@ -823,8 +823,8 @@ A: Parse `~` suffix from BFEN. When capturing `Q~`, add `P` (not `Q`) to partner
 ### Essential Commands
 ```
 # Initialization
-bup
-bupnewgame
+ubi
+ubinewgame
 isready / readyok
 quit
 

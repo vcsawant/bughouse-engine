@@ -1,4 +1,4 @@
-//! BUP (Bughouse Universal Protocol) parsing and formatting.
+//! UBI (Universal Bughouse Interface) parsing and formatting.
 //!
 //! This module is pure data transformation — no I/O.
 //! It converts between text lines and typed command/response enums.
@@ -28,12 +28,12 @@ pub enum PositionSpec {
     Bfen(String),
 }
 
-/// A parsed BUP command (GUI → Engine).
+/// A parsed UBI command (GUI → Engine).
 #[derive(Debug, Clone, PartialEq)]
-pub enum BupCommand {
-    Bup,
+pub enum UbiCommand {
+    Ubi,
     IsReady,
-    BupNewGame,
+    UbiNewGame,
     SetOption { name: String, value: Option<String> },
     Position { board: BoardId, fen: PositionSpec, moves: Vec<String> },
     Clock { target: ClockTarget, millis: u64 },
@@ -45,10 +45,10 @@ pub enum BupCommand {
 
 /// A response the engine sends back (Engine → GUI).
 #[derive(Debug, Clone, PartialEq)]
-pub enum BupResponse {
+pub enum UbiResponse {
     IdName(String),
     IdAuthor(String),
-    BupOk,
+    UbiOk,
     ReadyOk,
     Info { board: BoardId, depth: u32, nodes: usize, time_ms: u64, score_cp: i32 },
     BestMove { board: BoardId, move_str: String },
@@ -77,18 +77,18 @@ fn parse_clock_target(s: &str) -> Result<ClockTarget, String> {
     }
 }
 
-/// Parse one line of stdin into a BupCommand.
-pub fn parse_command(line: &str) -> Result<BupCommand, String> {
+/// Parse one line of stdin into a UbiCommand.
+pub fn parse_command(line: &str) -> Result<UbiCommand, String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
         return Err("empty command".to_string());
     }
 
     match tokens[0] {
-        "bup" => Ok(BupCommand::Bup),
-        "isready" => Ok(BupCommand::IsReady),
-        "bupnewgame" => Ok(BupCommand::BupNewGame),
-        "quit" => Ok(BupCommand::Quit),
+        "ubi" => Ok(UbiCommand::Ubi),
+        "isready" => Ok(UbiCommand::IsReady),
+        "ubinewgame" => Ok(UbiCommand::UbiNewGame),
+        "quit" => Ok(UbiCommand::Quit),
 
         "setoption" => parse_setoption(&tokens),
         "position" => parse_position(&tokens),
@@ -96,12 +96,12 @@ pub fn parse_command(line: &str) -> Result<BupCommand, String> {
         "go" => parse_go(&tokens),
         "stop" => parse_stop(&tokens),
 
-        _ => Ok(BupCommand::Unknown(line.to_string())),
+        _ => Ok(UbiCommand::Unknown(line.to_string())),
     }
 }
 
 /// Parse: `setoption name <id> [value <x>]`
-fn parse_setoption(tokens: &[&str]) -> Result<BupCommand, String> {
+fn parse_setoption(tokens: &[&str]) -> Result<UbiCommand, String> {
     // Find "name" keyword
     let name_idx = tokens.iter().position(|t| *t == "name")
         .ok_or("setoption: missing 'name' keyword")?;
@@ -116,11 +116,11 @@ fn parse_setoption(tokens: &[&str]) -> Result<BupCommand, String> {
 
     let value = value_idx.map(|vi| tokens[vi + 1..].join(" "));
 
-    Ok(BupCommand::SetOption { name, value })
+    Ok(UbiCommand::SetOption { name, value })
 }
 
 /// Parse: `position board <A|B> <startpos|bfen <6-field-string>> [moves <move1> ...]`
-fn parse_position(tokens: &[&str]) -> Result<BupCommand, String> {
+fn parse_position(tokens: &[&str]) -> Result<UbiCommand, String> {
     // tokens[0] = "position", tokens[1] = "board", tokens[2] = board id
     if tokens.len() < 4 || tokens[1] != "board" {
         return Err("position: expected 'board <A|B>'".to_string());
@@ -135,7 +135,7 @@ fn parse_position(tokens: &[&str]) -> Result<BupCommand, String> {
             } else {
                 Vec::new()
             };
-            Ok(BupCommand::Position { board, fen: PositionSpec::StartPos, moves })
+            Ok(UbiCommand::Position { board, fen: PositionSpec::StartPos, moves })
         }
         "bfen" => {
             // BFEN has exactly 6 space-separated fields
@@ -150,67 +150,67 @@ fn parse_position(tokens: &[&str]) -> Result<BupCommand, String> {
             } else {
                 Vec::new()
             };
-            Ok(BupCommand::Position { board, fen: PositionSpec::Bfen(bfen), moves })
+            Ok(UbiCommand::Position { board, fen: PositionSpec::Bfen(bfen), moves })
         }
         other => Err(format!("position: expected 'startpos' or 'bfen', got '{}'", other)),
     }
 }
 
 /// Parse: `clock <color_board> <milliseconds>`
-fn parse_clock(tokens: &[&str]) -> Result<BupCommand, String> {
+fn parse_clock(tokens: &[&str]) -> Result<UbiCommand, String> {
     if tokens.len() < 3 {
         return Err("clock: expected <target> <millis>".to_string());
     }
     let target = parse_clock_target(tokens[1])?;
     let millis = tokens[2].parse::<u64>()
         .map_err(|e| format!("clock: invalid millis: {}", e))?;
-    Ok(BupCommand::Clock { target, millis })
+    Ok(UbiCommand::Clock { target, millis })
 }
 
 /// Parse: `go board <A|B> [ignored params]`
-fn parse_go(tokens: &[&str]) -> Result<BupCommand, String> {
+fn parse_go(tokens: &[&str]) -> Result<UbiCommand, String> {
     if tokens.len() < 3 || tokens[1] != "board" {
         return Err("go: expected 'board <A|B>'".to_string());
     }
     let board = parse_board_id(tokens[2])?;
     // Search params are ignored in Phase B
-    Ok(BupCommand::Go { board })
+    Ok(UbiCommand::Go { board })
 }
 
 /// Parse: `stop [board <A|B>]`
-fn parse_stop(tokens: &[&str]) -> Result<BupCommand, String> {
+fn parse_stop(tokens: &[&str]) -> Result<UbiCommand, String> {
     if tokens.len() >= 3 && tokens[1] == "board" {
         let board = parse_board_id(tokens[2])?;
-        Ok(BupCommand::Stop { board: Some(board) })
+        Ok(UbiCommand::Stop { board: Some(board) })
     } else {
-        Ok(BupCommand::Stop { board: None })
+        Ok(UbiCommand::Stop { board: None })
     }
 }
 
 // ─── Formatting ──────────────────────────────────────────────────────
 
-/// Format a BupResponse into the exact stdout line (no trailing newline).
-pub fn format_response(resp: &BupResponse) -> String {
+/// Format a UbiResponse into the exact stdout line (no trailing newline).
+pub fn format_response(resp: &UbiResponse) -> String {
     match resp {
-        BupResponse::IdName(name) => format!("id name {}", name),
-        BupResponse::IdAuthor(author) => format!("id author {}", author),
-        BupResponse::BupOk => "bupok".to_string(),
-        BupResponse::ReadyOk => "readyok".to_string(),
-        BupResponse::Info { board, depth, nodes, time_ms, score_cp } => {
+        UbiResponse::IdName(name) => format!("id name {}", name),
+        UbiResponse::IdAuthor(author) => format!("id author {}", author),
+        UbiResponse::UbiOk => "ubiok".to_string(),
+        UbiResponse::ReadyOk => "readyok".to_string(),
+        UbiResponse::Info { board, depth, nodes, time_ms, score_cp } => {
             let board_str = match board { BoardId::A => "A", BoardId::B => "B" };
             format!("info board {} depth {} nodes {} time {} score cp {}",
                 board_str, depth, nodes, time_ms, score_cp)
         }
-        BupResponse::BestMove { board, move_str } => {
+        UbiResponse::BestMove { board, move_str } => {
             let board_str = match board { BoardId::A => "A", BoardId::B => "B" };
             format!("bestmove board {} {}", board_str, move_str)
         }
-        BupResponse::TeamMsg(msg) => format!("teammsg {}", msg),
+        UbiResponse::TeamMsg(msg) => format!("teammsg {}", msg),
     }
 }
 
-/// Format a BughouseMove for BUP output.
-/// Delegates to BughouseMove::Display which is already BUP-compliant
+/// Format a BughouseMove for UBI output.
+/// Delegates to BughouseMove::Display which is already UBI-compliant
 /// (regular moves as "e2e4", drops as "p@e4" lowercase).
 pub fn format_move(m: &BughouseMove) -> String {
     format!("{}", m)
@@ -227,29 +227,29 @@ mod tests {
     // --- Parsing tests ---
 
     #[test]
-    fn parse_bup() {
-        assert_eq!(parse_command("bup").unwrap(), BupCommand::Bup);
+    fn parse_ubi() {
+        assert_eq!(parse_command("ubi").unwrap(), UbiCommand::Ubi);
     }
 
     #[test]
     fn parse_isready() {
-        assert_eq!(parse_command("isready").unwrap(), BupCommand::IsReady);
+        assert_eq!(parse_command("isready").unwrap(), UbiCommand::IsReady);
     }
 
     #[test]
-    fn parse_bupnewgame() {
-        assert_eq!(parse_command("bupnewgame").unwrap(), BupCommand::BupNewGame);
+    fn parse_ubinewgame() {
+        assert_eq!(parse_command("ubinewgame").unwrap(), UbiCommand::UbiNewGame);
     }
 
     #[test]
     fn parse_quit() {
-        assert_eq!(parse_command("quit").unwrap(), BupCommand::Quit);
+        assert_eq!(parse_command("quit").unwrap(), UbiCommand::Quit);
     }
 
     #[test]
     fn parse_setoption_with_value() {
         let cmd = parse_command("setoption name Hash value 256").unwrap();
-        assert_eq!(cmd, BupCommand::SetOption {
+        assert_eq!(cmd, UbiCommand::SetOption {
             name: "Hash".to_string(),
             value: Some("256".to_string()),
         });
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn parse_setoption_no_value() {
         let cmd = parse_command("setoption name Clear Hash").unwrap();
-        assert_eq!(cmd, BupCommand::SetOption {
+        assert_eq!(cmd, UbiCommand::SetOption {
             name: "Clear Hash".to_string(),
             value: None,
         });
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn parse_position_startpos() {
         let cmd = parse_command("position board A startpos").unwrap();
-        assert_eq!(cmd, BupCommand::Position {
+        assert_eq!(cmd, UbiCommand::Position {
             board: BoardId::A,
             fen: PositionSpec::StartPos,
             moves: vec![],
@@ -279,7 +279,7 @@ mod tests {
         let cmd = parse_command(
             "position board B bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1"
         ).unwrap();
-        assert_eq!(cmd, BupCommand::Position {
+        assert_eq!(cmd, UbiCommand::Position {
             board: BoardId::B,
             fen: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1".to_string()
@@ -293,7 +293,7 @@ mod tests {
         let cmd = parse_command(
             "position board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1 moves e2e4 d7d5"
         ).unwrap();
-        assert_eq!(cmd, BupCommand::Position {
+        assert_eq!(cmd, UbiCommand::Position {
             board: BoardId::A,
             fen: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1".to_string()
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn parse_position_startpos_with_drop() {
         let cmd = parse_command("position board A startpos moves e2e4 n@f3").unwrap();
-        assert_eq!(cmd, BupCommand::Position {
+        assert_eq!(cmd, UbiCommand::Position {
             board: BoardId::A,
             fen: PositionSpec::StartPos,
             moves: vec!["e2e4".to_string(), "n@f3".to_string()],
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn parse_clock_white_a() {
         let cmd = parse_command("clock white_A 180000").unwrap();
-        assert_eq!(cmd, BupCommand::Clock {
+        assert_eq!(cmd, UbiCommand::Clock {
             target: ClockTarget { color: Color::White, board: BoardId::A },
             millis: 180000,
         });
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn parse_clock_black_b() {
         let cmd = parse_command("clock black_B 175000").unwrap();
-        assert_eq!(cmd, BupCommand::Clock {
+        assert_eq!(cmd, UbiCommand::Clock {
             target: ClockTarget { color: Color::Black, board: BoardId::B },
             millis: 175000,
         });
@@ -333,32 +333,32 @@ mod tests {
     #[test]
     fn parse_go() {
         let cmd = parse_command("go board A").unwrap();
-        assert_eq!(cmd, BupCommand::Go { board: BoardId::A });
+        assert_eq!(cmd, UbiCommand::Go { board: BoardId::A });
     }
 
     #[test]
     fn parse_go_with_params() {
         // Extra search params are ignored in Phase B
         let cmd = parse_command("go board B movetime 5000").unwrap();
-        assert_eq!(cmd, BupCommand::Go { board: BoardId::B });
+        assert_eq!(cmd, UbiCommand::Go { board: BoardId::B });
     }
 
     #[test]
     fn parse_stop() {
         let cmd = parse_command("stop").unwrap();
-        assert_eq!(cmd, BupCommand::Stop { board: None });
+        assert_eq!(cmd, UbiCommand::Stop { board: None });
     }
 
     #[test]
     fn parse_stop_board() {
         let cmd = parse_command("stop board A").unwrap();
-        assert_eq!(cmd, BupCommand::Stop { board: Some(BoardId::A) });
+        assert_eq!(cmd, UbiCommand::Stop { board: Some(BoardId::A) });
     }
 
     #[test]
     fn parse_unknown() {
         let cmd = parse_command("garbage xyz").unwrap();
-        assert_eq!(cmd, BupCommand::Unknown("garbage xyz".to_string()));
+        assert_eq!(cmd, UbiCommand::Unknown("garbage xyz".to_string()));
     }
 
     #[test]
@@ -382,23 +382,23 @@ mod tests {
 
     #[test]
     fn format_id_name() {
-        let resp = BupResponse::IdName("Foo".to_string());
+        let resp = UbiResponse::IdName("Foo".to_string());
         assert_eq!(format_response(&resp), "id name Foo");
     }
 
     #[test]
-    fn format_bupok() {
-        assert_eq!(format_response(&BupResponse::BupOk), "bupok");
+    fn format_ubiok() {
+        assert_eq!(format_response(&UbiResponse::UbiOk), "ubiok");
     }
 
     #[test]
     fn format_readyok() {
-        assert_eq!(format_response(&BupResponse::ReadyOk), "readyok");
+        assert_eq!(format_response(&UbiResponse::ReadyOk), "readyok");
     }
 
     #[test]
     fn format_info() {
-        let resp = BupResponse::Info {
+        let resp = UbiResponse::Info {
             board: BoardId::A,
             depth: 12,
             nodes: 150000,
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn format_bestmove_regular() {
-        let resp = BupResponse::BestMove {
+        let resp = UbiResponse::BestMove {
             board: BoardId::A,
             move_str: "e2e4".to_string(),
         };
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn format_bestmove_drop() {
-        let resp = BupResponse::BestMove {
+        let resp = UbiResponse::BestMove {
             board: BoardId::B,
             move_str: "n@f3".to_string(),
         };

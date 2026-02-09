@@ -1,8 +1,8 @@
 //! Engine state and command dispatch.
 //!
 //! Contains the `EngineState` struct (two boards, four clocks, RNG) and
-//! `process_command()` which maps parsed BUP commands to responses.
-//! No I/O — all output is returned as `Vec<BupResponse>`.
+//! `process_command()` which maps parsed UBI commands to responses.
+//! No I/O — all output is returned as `Vec<UbiResponse>`.
 
 use std::time::Instant;
 
@@ -10,7 +10,7 @@ use bughouse_chess::{Board, BughouseMove, MoveGen};
 use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 
-use crate::bup::{BoardId, BupCommand, BupResponse, ClockTarget, PositionSpec, format_move};
+use crate::ubi::{BoardId, UbiCommand, UbiResponse, ClockTarget, PositionSpec, format_move};
 
 // ─── Engine State ────────────────────────────────────────────────────
 
@@ -63,42 +63,42 @@ fn clock_index(target: &ClockTarget) -> usize {
 
 // ─── Command Dispatch ────────────────────────────────────────────────
 
-/// Process a parsed BUP command and return zero or more responses.
-pub fn process_command(state: &mut EngineState, cmd: &BupCommand) -> Vec<BupResponse> {
+/// Process a parsed UBI command and return zero or more responses.
+pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResponse> {
     match cmd {
-        BupCommand::Bup => vec![
-            BupResponse::IdName("BughouseEngine 0.1.0".to_string()),
-            BupResponse::IdAuthor("Viren Sawant".to_string()),
-            BupResponse::BupOk,
+        UbiCommand::Ubi => vec![
+            UbiResponse::IdName("BughouseEngine 0.1.0".to_string()),
+            UbiResponse::IdAuthor("Viren Sawant".to_string()),
+            UbiResponse::UbiOk,
         ],
 
-        BupCommand::IsReady => vec![BupResponse::ReadyOk],
+        UbiCommand::IsReady => vec![UbiResponse::ReadyOk],
 
-        BupCommand::BupNewGame => {
+        UbiCommand::UbiNewGame => {
             info!("[game:{}] New game — state reset", state.game_id);
             state.reset();
             vec![]
         }
 
-        BupCommand::SetOption { .. } => vec![],
+        UbiCommand::SetOption { .. } => vec![],
 
-        BupCommand::Position { board, fen, moves } => {
+        UbiCommand::Position { board, fen, moves } => {
             handle_position(state, *board, fen, moves);
             vec![]
         }
 
-        BupCommand::Clock { target, millis } => {
+        UbiCommand::Clock { target, millis } => {
             state.clocks[clock_index(target)] = *millis;
             vec![]
         }
 
-        BupCommand::Go { board } => handle_go(state, *board),
+        UbiCommand::Go { board } => handle_go(state, *board),
 
-        BupCommand::Stop { .. } => vec![],
+        UbiCommand::Stop { .. } => vec![],
 
-        BupCommand::Quit => vec![],
+        UbiCommand::Quit => vec![],
 
-        BupCommand::Unknown(line) => {
+        UbiCommand::Unknown(line) => {
             warn!("[game:{}] Unknown command: {}", state.game_id, line);
             vec![]
         }
@@ -149,7 +149,7 @@ fn handle_position(state: &mut EngineState, board_id: BoardId, fen: &PositionSpe
 
 // ─── Go handling (random move selection) ─────────────────────────────
 
-fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
+fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let board = match &state.boards[board_index(board_id)] {
         Some(b) => b,
         None => {
@@ -208,15 +208,15 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
     let random_msg = team_msgs.choose(&mut state.rng).unwrap();
 
     vec![
-        BupResponse::TeamMsg(random_msg.to_string()),
-        BupResponse::Info {
+        UbiResponse::TeamMsg(random_msg.to_string()),
+        UbiResponse::Info {
             board: board_id,
             depth: 0,
             nodes: combined.len(),
             time_ms: elapsed_ms,
             score_cp: 0,
         },
-        BupResponse::BestMove {
+        UbiResponse::BestMove {
             board: board_id,
             move_str: chosen_str,
         },
@@ -228,7 +228,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<BupResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bup::{BoardId, BupCommand, BupResponse, ClockTarget, PositionSpec};
+    use crate::ubi::{BoardId, UbiCommand, UbiResponse, ClockTarget, PositionSpec};
     use bughouse_chess::{Color, Piece, Square};
     use std::str::FromStr;
 
@@ -239,31 +239,31 @@ mod tests {
     #[test]
     fn handshake_flow() {
         let mut state = new_state();
-        let resp = process_command(&mut state, &BupCommand::Bup);
+        let resp = process_command(&mut state, &UbiCommand::Ubi);
         assert_eq!(resp.len(), 3);
-        assert!(matches!(&resp[0], BupResponse::IdName(n) if n.contains("BughouseEngine")));
-        assert!(matches!(&resp[1], BupResponse::IdAuthor(_)));
-        assert_eq!(resp[2], BupResponse::BupOk);
+        assert!(matches!(&resp[0], UbiResponse::IdName(n) if n.contains("BughouseEngine")));
+        assert!(matches!(&resp[1], UbiResponse::IdAuthor(_)));
+        assert_eq!(resp[2], UbiResponse::UbiOk);
     }
 
     #[test]
     fn isready_readyok() {
         let mut state = new_state();
-        let resp = process_command(&mut state, &BupCommand::IsReady);
-        assert_eq!(resp, vec![BupResponse::ReadyOk]);
+        let resp = process_command(&mut state, &UbiCommand::IsReady);
+        assert_eq!(resp, vec![UbiResponse::ReadyOk]);
     }
 
     #[test]
-    fn bupnewgame_resets() {
+    fn ubinewgame_resets() {
         let mut state = new_state();
         // Set up some state
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
         state.clocks = [100, 200, 300, 400];
 
         // Reset
-        process_command(&mut state, &BupCommand::BupNewGame);
+        process_command(&mut state, &UbiCommand::UbiNewGame);
         assert!(state.board(BoardId::A).is_none());
         assert!(state.board(BoardId::B).is_none());
         assert_eq!(state.clocks, [0; 4]);
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn position_startpos() {
         let mut state = new_state();
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
         let board = state.board(BoardId::A).unwrap();
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn position_bfen_with_reserves() {
         let mut state = new_state();
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A,
             fen: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1".to_string()
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn position_with_regular_moves() {
         let mut state = new_state();
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A,
             fen: PositionSpec::StartPos,
             moves: vec!["e2e4".to_string(), "d7d5".to_string()],
@@ -320,7 +320,7 @@ mod tests {
     fn position_with_drop_moves() {
         let mut state = new_state();
         // Use a BFEN with knight in white's reserve, white to move
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::B,
             fen: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQkq - 0 1".to_string()
@@ -344,7 +344,7 @@ mod tests {
             (ClockTarget { color: Color::Black, board: BoardId::B }, 178000u64),
         ];
         for (target, millis) in &targets {
-            process_command(&mut state, &BupCommand::Clock { target: *target, millis: *millis });
+            process_command(&mut state, &UbiCommand::Clock { target: *target, millis: *millis });
         }
         for (target, millis) in &targets {
             assert_eq!(state.clock(target), *millis);
@@ -354,25 +354,25 @@ mod tests {
     #[test]
     fn go_produces_teammsg_info_and_bestmove() {
         let mut state = new_state();
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         assert_eq!(resp.len(), 3);
-        assert!(matches!(&resp[0], BupResponse::TeamMsg(_)));
-        assert!(matches!(&resp[1], BupResponse::Info { board: BoardId::A, .. }));
-        assert!(matches!(&resp[2], BupResponse::BestMove { board: BoardId::A, .. }));
+        assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
+        assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::A, .. }));
+        assert!(matches!(&resp[2], UbiResponse::BestMove { board: BoardId::A, .. }));
     }
 
     #[test]
     fn go_bestmove_is_legal() {
         let mut state = new_state();
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         let move_str = match &resp[2] {
-            BupResponse::BestMove { move_str, .. } => move_str.clone(),
+            UbiResponse::BestMove { move_str, .. } => move_str.clone(),
             _ => panic!("expected BestMove"),
         };
 
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn go_unset_board() {
         let mut state = new_state();
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::B });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
         assert!(resp.is_empty());
     }
 
@@ -400,18 +400,18 @@ mod tests {
         // Position where white has pieces in reserve — drops should be possible
         // Use an empty-ish board where we block all regular moves but have reserves
         // Simpler: just set up a position with reserves and verify drops are in the count
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A,
             fen: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQkq - 0 1".to_string()
             ),
             moves: vec![],
         });
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         // Starting position has 20 regular moves. With a knight in reserve,
         // the knight can drop on all empty squares (32 squares in middle 4 ranks).
         // Total should be > 20
-        if let BupResponse::Info { nodes, .. } = &resp[1] {
+        if let UbiResponse::Info { nodes, .. } = &resp[1] {
             assert!(*nodes > 20, "expected drops to increase node count, got {}", nodes);
         } else {
             panic!("expected Info response");
@@ -421,12 +421,12 @@ mod tests {
     #[test]
     fn info_node_count() {
         let mut state = new_state();
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         // Starting position: 20 regular moves, 0 drops (empty reserves)
-        if let BupResponse::Info { nodes, .. } = &resp[1] {
+        if let UbiResponse::Info { nodes, .. } = &resp[1] {
             assert_eq!(*nodes, 20);
         } else {
             panic!("expected Info response");
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn setoption_silent() {
         let mut state = new_state();
-        let resp = process_command(&mut state, &BupCommand::SetOption {
+        let resp = process_command(&mut state, &UbiCommand::SetOption {
             name: "Hash".to_string(),
             value: Some("256".to_string()),
         });
@@ -446,14 +446,14 @@ mod tests {
     #[test]
     fn stop_returns_empty() {
         let mut state = new_state();
-        let resp = process_command(&mut state, &BupCommand::Stop { board: None });
+        let resp = process_command(&mut state, &UbiCommand::Stop { board: None });
         assert!(resp.is_empty());
     }
 
     #[test]
     fn unknown_returns_empty() {
         let mut state = new_state();
-        let resp = process_command(&mut state, &BupCommand::Unknown("garbage".to_string()));
+        let resp = process_command(&mut state, &UbiCommand::Unknown("garbage".to_string()));
         assert!(resp.is_empty());
     }
 
@@ -462,51 +462,51 @@ mod tests {
         let mut state = new_state();
 
         // Handshake
-        let resp = process_command(&mut state, &BupCommand::Bup);
+        let resp = process_command(&mut state, &UbiCommand::Ubi);
         assert_eq!(resp.len(), 3);
 
         // Ready check
-        let resp = process_command(&mut state, &BupCommand::IsReady);
+        let resp = process_command(&mut state, &UbiCommand::IsReady);
         assert_eq!(resp.len(), 1);
 
         // New game
-        let resp = process_command(&mut state, &BupCommand::BupNewGame);
+        let resp = process_command(&mut state, &UbiCommand::UbiNewGame);
         assert!(resp.is_empty());
 
         // Set up both boards
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::B, fen: PositionSpec::StartPos, moves: vec![],
         });
 
         // Set clocks
-        process_command(&mut state, &BupCommand::Clock {
+        process_command(&mut state, &UbiCommand::Clock {
             target: ClockTarget { color: Color::White, board: BoardId::A },
             millis: 180000,
         });
-        process_command(&mut state, &BupCommand::Clock {
+        process_command(&mut state, &UbiCommand::Clock {
             target: ClockTarget { color: Color::Black, board: BoardId::A },
             millis: 180000,
         });
 
         // Go on board A
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         assert_eq!(resp.len(), 3);
-        assert!(matches!(&resp[0], BupResponse::TeamMsg(_)));
-        assert!(matches!(&resp[1], BupResponse::Info { board: BoardId::A, .. }));
-        assert!(matches!(&resp[2], BupResponse::BestMove { board: BoardId::A, .. }));
+        assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
+        assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::A, .. }));
+        assert!(matches!(&resp[2], UbiResponse::BestMove { board: BoardId::A, .. }));
 
         // Go on board B
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::B });
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
         assert_eq!(resp.len(), 3);
-        assert!(matches!(&resp[0], BupResponse::TeamMsg(_)));
-        assert!(matches!(&resp[1], BupResponse::Info { board: BoardId::B, .. }));
-        assert!(matches!(&resp[2], BupResponse::BestMove { board: BoardId::B, .. }));
+        assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
+        assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::B, .. }));
+        assert!(matches!(&resp[2], UbiResponse::BestMove { board: BoardId::B, .. }));
 
         // Quit
-        let resp = process_command(&mut state, &BupCommand::Quit);
+        let resp = process_command(&mut state, &UbiCommand::Quit);
         assert!(resp.is_empty());
     }
 
@@ -515,11 +515,11 @@ mod tests {
         let mut state = new_state();
 
         // Test regular move format (from starting position)
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
         });
-        let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::A });
-        if let BupResponse::BestMove { move_str, .. } = &resp[2] {
+        let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
+        if let UbiResponse::BestMove { move_str, .. } = &resp[2] {
             // Regular UCI move: 4 chars like "e2e4" or 5 for promotion "e7e8q"
             assert!(move_str.len() >= 4, "move too short: {}", move_str);
             // Should not contain '@' (no reserves in starting position)
@@ -528,7 +528,7 @@ mod tests {
 
         // Test drop move format
         // Position where only drops are likely (give white a queen in reserve)
-        process_command(&mut state, &BupCommand::Position {
+        process_command(&mut state, &UbiCommand::Position {
             board: BoardId::B,
             fen: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[Q] w KQkq - 0 1".to_string()
@@ -538,8 +538,8 @@ mod tests {
         // Run go many times — at least one should be a drop
         let mut found_drop = false;
         for _ in 0..50 {
-            let resp = process_command(&mut state, &BupCommand::Go { board: BoardId::B });
-            if let BupResponse::BestMove { move_str, .. } = &resp[2] {
+            let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
+            if let UbiResponse::BestMove { move_str, .. } = &resp[2] {
                 if move_str.contains('@') {
                     // Drop format: lowercase piece letter + @ + square
                     assert_eq!(move_str.as_bytes()[0], b'q', "expected lowercase q, got {}", move_str);

@@ -2,7 +2,7 @@
 
 A Rust chess engine for [Bughouse](https://en.wikipedia.org/wiki/Bughouse_chess) — the 2v2 variant where captured pieces transfer to your partner's board for placement.
 
-This binary speaks the **BUP** (Bughouse Universal Protocol) on stdin/stdout and understands **BFEN** (Bughouse FEN) for board positions. It is designed to be spawned as an Erlang/Elixir `Port` by the [bughouse](https://github.com/vcsawant/bughouse) Phoenix application.
+This binary speaks the **UBI** (Universal Bughouse Interface) on stdin/stdout and understands **BFEN** (Bughouse FEN) for board positions. It is designed to be spawned as an Erlang/Elixir `Port` by the [bughouse](https://github.com/vcsawant/bughouse) Phoenix application.
 
 ---
 
@@ -16,16 +16,16 @@ Layer 5  │  Phoenix LiveView UI          (Elixir — real-time browser)
 Layer 4  │  Game orchestration + clocks  (Elixir GenServer)
          │
 Layer 3  │  ◀◀◀  bughouse-engine  ◀◀◀   (this binary — Rust)
-         │       BUP protocol, move search, evaluation
+         │       UBI protocol, move search, evaluation
          │
 Layer 2  │  Port wrapper                 (Elixir — spawns this binary,
-         │                                marshals BUP messages)
+         │                                marshals UBI messages)
          │
 Layer 1  │  Move validation              (Erlang — binbo_bughouse library,
          │                                source of truth for legality)
 ```
 
-During early development the Rust engine is a *suggester*: it proposes moves via BUP, but the Erlang engine (binbo_bughouse) performs the authoritative legality check before the move is committed. As confidence grows, the Rust engine can take on full validation responsibility.
+During early development the Rust engine is a *suggester*: it proposes moves via UBI, but the Erlang engine (binbo_bughouse) performs the authoritative legality check before the move is committed. As confidence grows, the Rust engine can take on full validation responsibility.
 
 ---
 
@@ -47,13 +47,13 @@ An extension of standard FEN that adds a reserve bracket and a promoted-piece ma
 - Pieces that were promoted (e.g. a pawn promoted to a queen) are marked with a `~` suffix in the position string: `Q~`. If that piece is later captured, it *demotes* back to a pawn before entering the capturer's reserve.
 - Empty reserves in bughouse mode emit `[]`.
 
-### BUP — Bughouse Universal Protocol (`docs/BUP.md`)
+### UBI — Universal Bughouse Interface (`docs/UBI.md`)
 
 A line-based stdin/stdout protocol (inspired by UCI) that supports dual-board bughouse games. Key commands this engine must handle:
 
 | Direction | Command | Description |
 |-----------|---------|-------------|
-| stdin  | `bup`                          | Handshake — engine must reply `bupok` |
+| stdin  | `ubi`                          | Handshake — engine must reply `ubiok` |
 | stdin  | `position board <A\|B> bfen <string>` | Set board state |
 | stdin  | `go board <A\|B>`              | Start searching; reply with `bestmove` |
 | stdin  | `clock <side>_<board> <ms> ...` | Update clock values |
@@ -64,7 +64,7 @@ A line-based stdin/stdout protocol (inspired by UCI) that supports dual-board bu
 
 Drop moves use `@` notation: `p@e4` places a pawn on e4.
 
-> **Note:** `BUP.md` is the authoritative protocol spec. An earlier integration design document in the Phoenix repo (`BUGHOUSE_ENGINE_INTEGRATION.md`) sketches a simplified variant; that will be reconciled in a future phase.
+> **Note:** `UBI.md` is the authoritative protocol spec. An earlier integration design document in the Phoenix repo (`BUGHOUSE_ENGINE_INTEGRATION.md`) sketches a simplified variant; that will be reconciled in a future phase.
 
 ---
 
@@ -80,7 +80,7 @@ cargo build                    # → target/debug/bughouse_engine
 # Build (release — optimised, no debug symbols)
 cargo build --release          # → target/release/bughouse_engine
 
-# Run interactively (type BUP commands, Ctrl-D to exit)
+# Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
 # Test (46 unit tests covering protocol parsing, state management, move generation)
@@ -90,7 +90,7 @@ cargo test
 The engine binary communicates over **stdin/stdout** only. It is not a server — it is spawned as a child process by the Elixir Port wrapper (Layer 2). To test it manually you can pipe commands into it:
 
 ```bash
-echo -e "bup\nisready\nbupnewgame\nposition board A startpos\ngo board A\nquit" \
+echo -e "ubi\nisready\nubinewgame\nposition board A startpos\ngo board A\nquit" \
   | ./target/debug/bughouse_engine
 ```
 
@@ -99,7 +99,7 @@ Example output:
 ```
 id name BughouseEngine 0.1.0
 id author Viren Sawant
-bupok
+ubiok
 readyok
 info board A depth 0 nodes 20 time 0 score cp 0
 bestmove board A e2e4
@@ -108,14 +108,14 @@ bestmove board A e2e4
 With reserves (drops available):
 
 ```bash
-echo -e "bup\nbupnewgame\nposition board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1\ngo board A\nquit" \
+echo -e "ubi\nubinewgame\nposition board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1\ngo board A\nquit" \
   | ./target/debug/bughouse_engine
 ```
 
 ```
 id name BughouseEngine 0.1.0
 id author Viren Sawant
-bupok
+ubiok
 info board A depth 0 nodes 116 time 0 score cp 0
 bestmove board A n@c3
 ```
@@ -127,7 +127,7 @@ bestmove board A n@c3
 ```
 src/
 ├── main.rs          # Thin I/O loop: stdin → parse → dispatch → format → stdout
-├── bup.rs           # BUP protocol parser & formatter (pure data, no I/O)
+├── ubi.rs           # UBI protocol parser & formatter (pure data, no I/O)
 └── game_state.rs    # EngineState + command dispatch → responses (no I/O)
 ```
 
@@ -146,14 +146,14 @@ Development proceeds in four phases, each building on the last:
 
 ### Phase B — Random-move bot (complete)
 
-The minimum viable engine. Parses BUP commands, maintains board state via BFEN, generates all legal moves (regular + drops), picks one at random, and returns `bestmove`. This validates the entire plumbing: Rust binary ↔ Elixir Port ↔ BUP protocol ↔ BFEN parsing ↔ move generation.
+The minimum viable engine. Parses UBI commands, maintains board state via BFEN, generates all legal moves (regular + drops), picks one at random, and returns `bestmove`. This validates the entire plumbing: Rust binary ↔ Elixir Port ↔ UBI protocol ↔ BFEN parsing ↔ move generation.
 
 **Implemented:**
-- `bup.rs` — BUP protocol parser & formatter (28 unit tests)
+- `ubi.rs` — UBI protocol parser & formatter (28 unit tests)
 - `game_state.rs` — engine state, command dispatch, random move selection (18 unit tests)
 - `main.rs` — thin I/O loop with BufWriter for efficient stdout
-- Full BUP handshake (`bup`/`bupok`), position setup (`startpos` / `bfen`), clock tracking, `go` / `stop` / `quit`
-- Drop moves from reserves with BUP-compliant lowercase notation (`p@e4`, `n@f3`)
+- Full UBI handshake (`ubi`/`ubiok`), position setup (`startpos` / `bfen`), clock tracking, `go` / `stop` / `quit`
+- Drop moves from reserves with UBI-compliant lowercase notation (`p@e4`, `n@f3`)
 
 ### Phase C — Basic heuristics
 
