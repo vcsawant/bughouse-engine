@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (46 unit tests covering protocol parsing, state management, move generation)
+# Test (63 unit tests covering protocol, state, evaluation, search)
 cargo test
 ```
 
@@ -76,8 +76,9 @@ id name BughouseEngine 0.1.0
 id author Viren Sawant
 ubiok
 readyok
-info board A depth 0 nodes 20 time 0 score cp 0
-bestmove board A e2e4
+teammsg need p
+info board A depth 1 nodes 20 time 0 score cp 66
+bestmove board A b1c3
 ```
 
 With reserves (drops available):
@@ -91,8 +92,9 @@ echo -e "ubi\nubinewgame\nposition board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPP
 id name BughouseEngine 0.1.0
 id author Viren Sawant
 ubiok
-info board A depth 0 nodes 116 time 0 score cp 0
-bestmove board A n@c3
+teammsg threat critical
+info board A depth 1 nodes 80 time 1 score cp 617
+bestmove board A q@e6
 ```
 
 ---
@@ -103,14 +105,15 @@ bestmove board A n@c3
 src/
 ├── main.rs          # Thin I/O loop: stdin → parse → dispatch → format → stdout
 ├── ubi.rs           # UBI protocol parser & formatter (pure data, no I/O)
-└── game_state.rs    # EngineState + command dispatch → responses (no I/O)
+├── game_state.rs    # EngineState + command dispatch → responses (no I/O)
+├── strategy.rs      # PlayStyle enum + time-aware style selection (stub for Phase C)
+├── scoring.rs       # Static evaluation: material, reserves, PSTs, king safety, mobility, pawns
+└── search.rs        # 1-ply search with drop pruning
 ```
 
 Board representation, move generation, BFEN parsing, and drop logic all live in the [bughouse-chess](https://github.com/vcsawant/bughouse-chess) library. The engine is deliberately thin — it wires protocol parsing to the library's game logic.
 
 Future phases will add:
-- `search.rs` — tree search (minimax/alpha-beta or MCTS)
-- `scoring.rs` — static evaluation function (material, position, reserves)
 - `time.rs` — clock management and time allocation per move
 
 ---
@@ -140,13 +143,25 @@ The minimum viable engine. Parses UBI commands, maintains board state via BFEN, 
 - Full UBI handshake (`ubi`/`ubiok`), position setup (`startpos` / `bfen`), clock tracking, `go` / `stop` / `quit`
 - Drop moves from reserves with UBI-compliant lowercase notation (`p@e4`, `n@f3`)
 
-### Phase C — Basic heuristics
+### Phase C — Static evaluation + 1-ply search (complete)
 
-Replace random selection with a scored choice. No tree search yet — just evaluate each legal move with a simple scoring function and pick the best.
+Replace random selection with a scored evaluation function and 1-ply search. The engine evaluates every legal move and picks the best based on position analysis.
 
-**Deliverables:**
-- `scoring.rs` — material counting (piece values), basic positional tables
-- `search.rs` — 1-ply search (evaluate all moves, pick max score)
+**Implemented:**
+- `strategy.rs` — `PlayStyle` enum with 5 variants (Blitz, Standard, Extended, Slow, Instant); stub `determine_play_style()` always returns Blitz for Phase C
+- `scoring.rs` — static evaluation function (17 unit tests) with 7 components:
+  - Material counting (P=100, N=320, B=330, R=500, Q=900)
+  - Reserve valuation at 70% discount
+  - Piece-square tables (midgame, per-piece type)
+  - King safety: pawn shield, open files, attacker count, reserve amplifier
+  - Mobility: piece attack squares (knights, bishops, rooks, queens)
+  - Pawn structure: doubled, isolated, and passed pawn detection
+  - King capturable terminal detection (+30000)
+- `search.rs` — 1-ply negamax search (6 unit tests) with:
+  - Score-based move selection across regular moves and drops
+  - Drop pruning: generates drops only on ~30-50 relevant squares (attack zone, defense zone, center, promotion zone) instead of all ~200+ empty squares
+  - King capture shortcut and self-capture avoidance (-30000)
+- `game_state.rs` — wired search into `handle_go()`, reports depth 1 with actual score and node count
 
 ### Phase D — Real search
 
@@ -239,7 +254,7 @@ This framework maps onto the existing roadmap:
 
 | Phase | Time-related deliverable |
 |---|---|
-| **Phase C** | `TimeState` enum, `determine_time_state()`, basic search budget allocation |
+| **Phase C** | `PlayStyle` enum, `determine_play_style()` stub, basic search budget allocation |
 | **Phase D** | `time.rs` — full time management, stall detection, search depth adjustment |
 | **Phase E** | Partner-aware stalling (waiting for pieces), opponent time pressure tactics |
 

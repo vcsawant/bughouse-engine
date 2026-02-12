@@ -21,15 +21,16 @@ Always run `cargo test` after changes. All tests must pass before committing.
 src/
 ├── main.rs          # Thin I/O loop only. No logic here.
 ├── ubi.rs           # UBI protocol parsing & formatting (pure data, no I/O)
-└── game_state.rs    # EngineState, command dispatch, move selection (no I/O)
+├── game_state.rs    # EngineState, command dispatch, move selection (no I/O)
+├── strategy.rs      # PlayStyle enum + time-aware style selection
+├── scoring.rs       # Static evaluation function (material, PSTs, king safety, etc.)
+└── search.rs        # 1-ply search with drop pruning
 docs/
 ├── BFEN.md          # Bughouse FEN spec v0.1 (authoritative)
 └── UBI.md           # Universal Bughouse Interface spec v0.1 (authoritative)
 ```
 
 Future files (not yet created):
-- `src/scoring.rs` — static evaluation function (Phase C)
-- `src/search.rs` — tree search: minimax/alpha-beta (Phase D)
 - `src/time.rs` — clock management and time-aware strategy (Phase D)
 
 ## Architecture principles
@@ -48,6 +49,8 @@ Future files (not yet created):
 - **Board indexing**: Board A = index 0, Board B = index 1. Four clocks: `[white_A, black_A, white_B, black_B]`.
 
 ## External dependency: bughouse-chess
+
+When looking up bughouse-chess library source code, check `../bughouse-chess` first (the local sibling checkout). Only fall back to `~/.cargo/git/checkouts/bughouse-chess-*` if the local checkout isn't there.
 
 The engine depends on [bughouse-chess](https://github.com/vcsawant/bughouse-chess) — a fork of `jordanbray/chess` adapted for bughouse. It provides:
 - Bitboard board representation with reserves

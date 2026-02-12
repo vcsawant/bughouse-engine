@@ -1,5 +1,8 @@
 mod ubi;
 mod game_state;
+mod strategy;
+mod scoring;
+mod search;
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::fs::File;
