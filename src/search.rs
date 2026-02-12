@@ -11,14 +11,17 @@ use bughouse_chess::{
     get_file, get_king_moves, get_rank,
 };
 
+use log::debug;
+
 use crate::scoring;
 use crate::strategy::PlayStyle;
 
-/// Result of a search: the best move found, its score, and nodes evaluated.
+/// Result of a search: the best move found, its score, nodes evaluated, and principal variation.
 pub struct SearchResult {
     pub best_move: BughouseMove,
     pub score: i32,
     pub nodes: usize,
+    pub pv: Vec<String>,
 }
 
 /// Find the best move for the current position using 1-ply search.
@@ -35,8 +38,12 @@ pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchRes
     let mut best_score = i32::MIN;
     let mut nodes = 0usize;
 
+    // Count regular moves for logging
+    let regular_moves: Vec<_> = MoveGen::new_legal(board).collect();
+    let regular_count = regular_moves.len();
+
     // Evaluate all regular moves
-    for cm in MoveGen::new_legal(board) {
+    for cm in regular_moves {
         let new_board = board.make_move_new(cm);
         let score = score_child(&new_board);
         nodes += 1;
@@ -44,6 +51,13 @@ pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchRes
         if score > best_score {
             best_score = score;
             best_move = Some(BughouseMove::Regular(cm));
+
+            let bd = scoring::evaluate_detailed(&new_board);
+            debug!(
+                "New best: {} score={} (mat={} res={} pst={} king={} mob={} pawn={})",
+                BughouseMove::Regular(cm), score,
+                bd.material, bd.reserves, bd.pst, bd.king_safety, bd.mobility, bd.pawn_structure
+            );
         }
     }
 
@@ -53,6 +67,8 @@ pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchRes
     let reserves = board.reserves(us);
     let combined = *board.combined();
     let empty_targets = drop_mask & !combined;
+
+    let mut drop_count = 0usize;
 
     for (piece, count) in reserves.iter() {
         if count == 0 || piece == Piece::King {
@@ -71,19 +87,38 @@ pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchRes
             if let Some(new_board) = board.make_drop_new(piece, sq) {
                 let score = score_child(&new_board);
                 nodes += 1;
+                drop_count += 1;
 
                 if score > best_score {
                     best_score = score;
-                    best_move = Some(BughouseMove::Drop { piece, square: sq });
+                    let drop_move = BughouseMove::Drop { piece, square: sq };
+                    best_move = Some(drop_move);
+
+                    let bd = scoring::evaluate_detailed(&new_board);
+                    debug!(
+                        "New best: {} score={} (mat={} res={} pst={} king={} mob={} pawn={})",
+                        drop_move, score,
+                        bd.material, bd.reserves, bd.pst, bd.king_safety, bd.mobility, bd.pawn_structure
+                    );
                 }
             }
         }
     }
 
-    best_move.map(|m| SearchResult {
-        best_move: m,
-        score: best_score,
-        nodes,
+    debug!(
+        "Search: {} regular + {} drops = {} candidates",
+        regular_count, drop_count, nodes
+    );
+
+    best_move.map(|m| {
+        let move_str = format!("{}", m);
+        debug!("Best: {} score={} nodes={}", move_str, best_score, nodes);
+        SearchResult {
+            best_move: m,
+            score: best_score,
+            nodes,
+            pv: vec![move_str],
+        }
     })
 }
 
@@ -105,8 +140,10 @@ fn find_king_capture(board: &Board) -> Option<SearchResult> {
 
     for cm in MoveGen::new_legal(board) {
         if cm.get_dest() == king_sq {
+            let m = BughouseMove::Regular(cm);
             return Some(SearchResult {
-                best_move: BughouseMove::Regular(cm),
+                pv: vec![format!("{}", m)],
+                best_move: m,
                 score: 30000,
                 nodes: 1,
             });

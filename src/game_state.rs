@@ -207,6 +207,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
             nodes: result.nodes,
             time_ms: elapsed_ms,
             score_cp: result.score,
+            pv: result.pv,
         },
         UbiResponse::BestMove {
             board: board_id,

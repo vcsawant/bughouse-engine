@@ -50,7 +50,7 @@ pub enum UbiResponse {
     IdAuthor(String),
     UbiOk,
     ReadyOk,
-    Info { board: BoardId, depth: u32, nodes: usize, time_ms: u64, score_cp: i32 },
+    Info { board: BoardId, depth: u32, nodes: usize, time_ms: u64, score_cp: i32, pv: Vec<String> },
     BestMove { board: BoardId, move_str: String },
     TeamMsg(String),
 }
@@ -196,10 +196,15 @@ pub fn format_response(resp: &UbiResponse) -> String {
         UbiResponse::IdAuthor(author) => format!("id author {}", author),
         UbiResponse::UbiOk => "ubiok".to_string(),
         UbiResponse::ReadyOk => "readyok".to_string(),
-        UbiResponse::Info { board, depth, nodes, time_ms, score_cp } => {
+        UbiResponse::Info { board, depth, nodes, time_ms, score_cp, pv } => {
             let board_str = match board { BoardId::A => "A", BoardId::B => "B" };
-            format!("info board {} depth {} nodes {} time {} score cp {}",
-                board_str, depth, nodes, time_ms, score_cp)
+            let mut s = format!("info board {} depth {} nodes {} time {} score cp {}",
+                board_str, depth, nodes, time_ms, score_cp);
+            if !pv.is_empty() {
+                s.push_str(" pv ");
+                s.push_str(&pv.join(" "));
+            }
+            s
         }
         UbiResponse::BestMove { board, move_str } => {
             let board_str = match board { BoardId::A => "A", BoardId::B => "B" };
@@ -404,10 +409,27 @@ mod tests {
             nodes: 150000,
             time_ms: 2000,
             score_cp: 45,
+            pv: vec!["e2e4".into()],
         };
         assert_eq!(
             format_response(&resp),
-            "info board A depth 12 nodes 150000 time 2000 score cp 45"
+            "info board A depth 12 nodes 150000 time 2000 score cp 45 pv e2e4"
+        );
+    }
+
+    #[test]
+    fn format_info_empty_pv() {
+        let resp = UbiResponse::Info {
+            board: BoardId::B,
+            depth: 1,
+            nodes: 20,
+            time_ms: 0,
+            score_cp: -10,
+            pv: vec![],
+        };
+        assert_eq!(
+            format_response(&resp),
+            "info board B depth 1 nodes 20 time 0 score cp -10"
         );
     }
 

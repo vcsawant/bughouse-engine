@@ -77,7 +77,7 @@ id author Viren Sawant
 ubiok
 readyok
 teammsg need p
-info board A depth 1 nodes 20 time 0 score cp 66
+info board A depth 1 nodes 20 time 0 score cp 66 pv b1c3
 bestmove board A b1c3
 ```
 
@@ -93,7 +93,7 @@ id name BughouseEngine 0.1.0
 id author Viren Sawant
 ubiok
 teammsg threat critical
-info board A depth 1 nodes 80 time 1 score cp 617
+info board A depth 1 nodes 80 time 1 score cp 617 pv q@e6
 bestmove board A q@e6
 ```
 
@@ -179,6 +179,7 @@ The engine understands it's playing bughouse, not just two independent chess gam
 - Reserve valuation (a held queen is worth less than a held pawn in some situations)
 - Partner awareness via `teammsg` / `partnermsg`
 - Positional adjustments for bughouse (e.g. king safety is less important when your partner can drop a defender)
+- Live `info` line streaming during search for real-time GUI thinking display (requires iterative deepening from Phase D)
 
 ---
 

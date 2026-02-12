@@ -371,32 +371,67 @@ fn is_passed_pawn(sq: Square, color: Color, opp_pawns: BitBoard) -> bool {
 
 // ─── Main Evaluation ────────────────────────────────────────────────
 
-/// Evaluate a position, returning centipawns from the perspective of
-/// `board.side_to_move()`. Positive = good for the side to move.
-pub fn evaluate(board: &Board) -> i32 {
+/// Per-component evaluation breakdown (from the side-to-move perspective).
+pub struct EvalBreakdown {
+    pub material: i32,
+    pub reserves: i32,
+    pub pst: i32,
+    pub king_safety: i32,
+    pub mobility: i32,
+    pub pawn_structure: i32,
+    pub total: i32,
+}
+
+/// Evaluate a position with full component breakdown, returning centipawns
+/// from the perspective of `board.side_to_move()`. Positive = good for the side to move.
+pub fn evaluate_detailed(board: &Board) -> EvalBreakdown {
     // Terminal check: if king is capturable, side to move wins
     if board.status() == BoardStatus::KingCapturable {
-        return 30000;
+        return EvalBreakdown {
+            material: 0,
+            reserves: 0,
+            pst: 0,
+            king_safety: 0,
+            mobility: 0,
+            pawn_structure: 0,
+            total: 30000,
+        };
     }
 
     let white = Color::White;
     let black = Color::Black;
 
-    // Compute each component for white and black
-    let material = material_score(board, white) - material_score(board, black);
-    let reserves = reserve_score(board, white) - reserve_score(board, black);
-    let pst = pst_score(board, white) - pst_score(board, black);
+    // Compute each component for white and black (from white's perspective)
+    let mat = material_score(board, white) - material_score(board, black);
+    let res = reserve_score(board, white) - reserve_score(board, black);
+    let pst_val = pst_score(board, white) - pst_score(board, black);
     let king = king_safety(board, white) - king_safety(board, black);
-    let mobility = mobility_score(board, white) - mobility_score(board, black);
+    let mob = mobility_score(board, white) - mobility_score(board, black);
     let pawns = pawn_structure(board, white) - pawn_structure(board, black);
 
-    let total = material + reserves + pst + king + mobility + pawns;
+    let total = mat + res + pst_val + king + mob + pawns;
 
     // Adjust for side to move
-    match board.side_to_move() {
-        Color::White => total,
-        Color::Black => -total,
+    let sign = match board.side_to_move() {
+        Color::White => 1,
+        Color::Black => -1,
+    };
+
+    EvalBreakdown {
+        material: mat * sign,
+        reserves: res * sign,
+        pst: pst_val * sign,
+        king_safety: king * sign,
+        mobility: mob * sign,
+        pawn_structure: pawns * sign,
+        total: total * sign,
     }
+}
+
+/// Evaluate a position, returning centipawns from the perspective of
+/// `board.side_to_move()`. Positive = good for the side to move.
+pub fn evaluate(board: &Board) -> i32 {
+    evaluate_detailed(board).total
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
