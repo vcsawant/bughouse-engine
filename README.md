@@ -2,30 +2,7 @@
 
 A Rust chess engine for [Bughouse](https://en.wikipedia.org/wiki/Bughouse_chess) — the 2v2 variant where captured pieces transfer to your partner's board for placement.
 
-This binary speaks the **UBI** (Universal Bughouse Interface) on stdin/stdout and understands **BFEN** (Bughouse FEN) for board positions. It is designed to be spawned as an Erlang/Elixir `Port` by the [bughouse](https://github.com/vcsawant/bughouse) Phoenix application.
-
----
-
-## Where this fits: the 5-layer architecture
-
-The bughouse platform is split into five layers. This engine lives at **layers 3 and 4**:
-
-```
-Layer 5  │  Phoenix LiveView UI          (Elixir — real-time browser)
-         │
-Layer 4  │  Game orchestration + clocks  (Elixir GenServer)
-         │
-Layer 3  │  ◀◀◀  bughouse-engine  ◀◀◀   (this binary — Rust)
-         │       UBI protocol, move search, evaluation
-         │
-Layer 2  │  Port wrapper                 (Elixir — spawns this binary,
-         │                                marshals UBI messages)
-         │
-Layer 1  │  Move validation              (Erlang — binbo_bughouse library,
-         │                                source of truth for legality)
-```
-
-During early development the Rust engine is a *suggester*: it proposes moves via UBI, but the Erlang engine (binbo_bughouse) performs the authoritative legality check before the move is committed. As confidence grows, the Rust engine can take on full validation responsibility.
+This binary speaks the **UBI** (Universal Bughouse Interface) on stdin/stdout and understands **BFEN** (Bughouse FEN) for board positions. Any GUI or game server can spawn it as a child process and communicate via the UBI text protocol — the same way UCI engines work for standard chess.
 
 ---
 
@@ -64,8 +41,6 @@ A line-based stdin/stdout protocol (inspired by UCI) that supports dual-board bu
 
 Drop moves use `@` notation: `p@e4` places a pawn on e4.
 
-> **Note:** `UBI.md` is the authoritative protocol spec. An earlier integration design document in the Phoenix repo (`BUGHOUSE_ENGINE_INTEGRATION.md`) sketches a simplified variant; that will be reconciled in a future phase.
-
 ---
 
 ## Build & run
@@ -87,7 +62,7 @@ cargo run
 cargo test
 ```
 
-The engine binary communicates over **stdin/stdout** only. It is not a server — it is spawned as a child process by the Elixir Port wrapper (Layer 2). To test it manually you can pipe commands into it:
+The engine binary communicates over **stdin/stdout** only. It is not a server — it is spawned as a child process by a GUI or game server. To test it manually you can pipe commands into it:
 
 ```bash
 echo -e "ubi\nisready\nubinewgame\nposition board A startpos\ngo board A\nquit" \
@@ -142,11 +117,21 @@ Future phases will add:
 
 ## Roadmap
 
-Development proceeds in four phases, each building on the last:
+Development proceeds in five phases, each building on the last:
+
+### Phase A — Specs and scaffolding (complete)
+
+Define the protocols and set up the project skeleton before the engine can play a single move.
+
+**Implemented:**
+- BFEN spec (`docs/BFEN.md`) — bughouse FEN with reserves bracket and promoted-piece marker
+- UBI spec (`docs/UBI.md`) — line-based stdin/stdout protocol for dual-board bughouse
+- Project scaffolding — Cargo.toml, directory structure, `bughouse-chess` library dependency
+- Thin I/O loop (`main.rs`) — stdin → parse → dispatch → format → stdout
 
 ### Phase B — Random-move bot (complete)
 
-The minimum viable engine. Parses UBI commands, maintains board state via BFEN, generates all legal moves (regular + drops), picks one at random, and returns `bestmove`. This validates the entire plumbing: Rust binary ↔ Elixir Port ↔ UBI protocol ↔ BFEN parsing ↔ move generation.
+The minimum viable engine. Parses UBI commands, maintains board state via BFEN, generates all legal moves (regular + drops), picks one at random, and returns `bestmove`. This validates the entire pipeline: UBI protocol ↔ BFEN parsing ↔ move generation ↔ bestmove response.
 
 **Implemented:**
 - `ubi.rs` — UBI protocol parser & formatter (28 unit tests)
@@ -182,14 +167,81 @@ The engine understands it's playing bughouse, not just two independent chess gam
 
 ---
 
-## Relationship to binbo_bughouse
+## Evaluation strategy: time-aware move selection
 
-[binbo_bughouse](https://github.com/vcsawant/binbo-bughouse) is the Erlang chess engine that currently powers the Phoenix app. It is the **source of truth** for move validation and already ships spec-compliant BFEN (single-bracket reserves, `~` promoted pieces, full round-trip fidelity).
+Bughouse evaluation differs fundamentally from standard chess. Beyond material and position, the engine must reason about **four clocks**, **two boards**, **reserves**, and **partner coordination**. The core insight driving our evaluation design:
 
-During development, binbo validates every move this engine suggests. This two-engine setup means:
-- You can develop and test the Rust engine independently (it doesn't need to be perfect).
-- Illegal moves proposed by the Rust engine are simply rejected — the app stays correct.
-- Over time, as the Rust engine matures, it can absorb validation responsibility too.
+> **Time dynamics determine strategic constraints _before_ move selection.** Rather than encoding time awareness into the evaluation function, we filter the strategic mode first, then search within those constraints.
+
+### Time state detection
+
+In bughouse, exactly two of the four clocks are always running (one per board). When it is the engine's turn, the clock configurations reduce to two cases:
+
+| Configuration | Active clocks | Implication |
+|---|---|---|
+| **Both team clocks active** | Player + Teammate | TIME DISADVANTAGE — both our clocks drain simultaneously. Play quickly, accept risk. |
+| **One team clock + one opponent clock** | Player + Opponent's teammate | Depends on relative time — compare `player_time` vs `opponent_teammate_time`. |
+
+A third comparison matters even when the direct opponent's clock is paused: `player_time` vs `opponent_time`. If the engine has 60s and the opponent has 10s, the engine can afford slow, forcing moves that burn the opponent's remaining time.
+
+These combine into four strategic time states:
+
+| State | Condition | Strategy |
+|---|---|---|
+| `Disadvantage` | Both team clocks running | Play fast, accept risk, shallow search |
+| `PotentialAdvantage` | Player has significantly more time than the active opponent-side clock | Bank time, consider stalling, prepare tempo plays |
+| `MildDisadvantage` | Opponent team has more total active time | Play solid, standard search depth |
+| `LocalAdvantage` | Player has significantly more time than direct opponent (even if opponent's clock is paused) | Deep search, play forcing moves to exploit opponent's time trouble |
+
+### Strategic decision tree
+
+Move selection follows a three-level decision tree:
+
+**Level 1 — Can we stall?**
+Stalling is only viable in `PotentialAdvantage` or `LocalAdvantage` states. When both team clocks are running, stalling is self-destructive.
+
+**Level 2 — Should we stall?**
+Even when stalling is possible, it must have strategic value:
+- Waiting for a critical piece from the partner (e.g., partner is about to capture a queen)
+- Partner is in a losing position and needs thinking time
+- Direct opponent is in severe time trouble (< 5s) — stalling applies pressure
+- No good moves are available — waiting for the position to improve
+
+Counter-stalling detection: if the opponent can also stall, avoid mutual deadlock and play normally.
+
+**Level 3 — Move selection within strategy**
+
+| Time state | Search budget | Move preference |
+|---|---|---|
+| `Disadvantage` | ~500ms, shallow | Aggressive, forcing moves |
+| `MildDisadvantage` | ~1500ms, standard | Solid positional play |
+| `PotentialAdvantage` / `LocalAdvantage` | ~3000ms, deep | Best move with full search |
+| Stalling | Minimal | Quiet, non-committal moves that maintain flexibility and king safety |
+| Ultra-low time (< 1s) | Instant | Pre-calculated safe move |
+
+### Stall move selection
+
+When the engine decides to stall, it picks the quietest safe move available:
+- No captures, no checks, no aggressive drops
+- Prefer moves that improve king safety
+- Prefer moves that maximize future legal move count (maintain flexibility)
+- Avoid committing material or weakening pawn structure
+
+### Edge cases
+
+- **Immediate win available**: Always play a winning tactic regardless of time state.
+- **Opponent counter-stalling**: If both sides can stall, default to normal play to avoid deadlock.
+- **Ultra-low time (< 1s)**: Bypass all strategy and play a pre-calculated safe move instantly.
+
+### Implementation phases
+
+This framework maps onto the existing roadmap:
+
+| Phase | Time-related deliverable |
+|---|---|
+| **Phase C** | `TimeState` enum, `determine_time_state()`, basic search budget allocation |
+| **Phase D** | `time.rs` — full time management, stall detection, search depth adjustment |
+| **Phase E** | Partner-aware stalling (waiting for pieces), opponent time pressure tactics |
 
 ---
 
