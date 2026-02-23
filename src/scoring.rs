@@ -161,9 +161,9 @@ fn material_score(board: &Board, color: Color) -> i32 {
 
 /// Reserve value for one color with per-piece premium multiplier.
 fn reserve_score(board: &Board, color: Color) -> i32 {
-    let reserves = board.reserves(color);
+    let reserve = &board.reserves()[color.to_index()];
     let mut score = 0;
-    for (piece, count) in reserves.iter() {
+    for (piece, count) in reserve.iter() {
         score += count as i32 * piece_value(piece) * reserve_multiplier(piece) / 100;
     }
     score
@@ -171,9 +171,9 @@ fn reserve_score(board: &Board, color: Color) -> i32 {
 
 /// Total reserve material value (full price, no discount) for one color.
 fn reserve_material_value(board: &Board, color: Color) -> i32 {
-    let reserves = board.reserves(color);
+    let reserve = &board.reserves()[color.to_index()];
     let mut value = 0;
-    for (piece, count) in reserves.iter() {
+    for (piece, count) in reserve.iter() {
         value += count as i32 * piece_value(piece);
     }
     value
@@ -385,17 +385,32 @@ pub struct EvalBreakdown {
 /// Evaluate a position with full component breakdown, returning centipawns
 /// from the perspective of `board.side_to_move()`. Positive = good for the side to move.
 pub fn evaluate_detailed(board: &Board) -> EvalBreakdown {
-    // Terminal check: if king is capturable, side to move wins
-    if board.status() == BoardStatus::KingCapturable {
-        return EvalBreakdown {
-            material: 0,
-            reserves: 0,
-            pst: 0,
-            king_safety: 0,
-            mobility: 0,
-            pawn_structure: 0,
-            total: 30000,
-        };
+    // Terminal checks
+    match board.status() {
+        BoardStatus::Checkmate => {
+            // Side to move is checkmated → worst possible score
+            return EvalBreakdown {
+                material: 0,
+                reserves: 0,
+                pst: 0,
+                king_safety: 0,
+                mobility: 0,
+                pawn_structure: 0,
+                total: -30000,
+            };
+        }
+        BoardStatus::Stalemate => {
+            return EvalBreakdown {
+                material: 0,
+                reserves: 0,
+                pst: 0,
+                king_safety: 0,
+                mobility: 0,
+                pawn_structure: 0,
+                total: 0,
+            };
+        }
+        BoardStatus::Ongoing => {}
     }
 
     let white = Color::White;
@@ -530,16 +545,25 @@ mod tests {
     }
 
     #[test]
-    fn king_capturable_max_score() {
-        // If king is capturable, score should be +30000
-        // This requires a position where the side to move can capture the king
-        // We use a position with exposed king
-        let board: Board = "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBqKBNR[] w KQkq - 0 1"
+    fn checkmate_score() {
+        // If side to move is checkmated, score should be -30000
+        // Adjacent queen checkmate: black king h8, white queen g7 (defended by pawn f6)
+        let board: Board = "7k/6Q1/5P2/8/8/8/8/K7[] b - - 0 1"
             .parse()
             .unwrap();
-        // Check if this results in KingCapturable
-        if board.status() == BoardStatus::KingCapturable {
-            assert_eq!(evaluate(&board), 30000);
+        if board.status() == BoardStatus::Checkmate {
+            assert_eq!(evaluate(&board), -30000);
+        }
+    }
+
+    #[test]
+    fn stalemate_score() {
+        // Stalemate should evaluate to 0
+        let board: Board = "7k/6Q1/8/8/8/8/8/5K2[] b - - 0 1"
+            .parse()
+            .unwrap();
+        if board.status() == BoardStatus::Stalemate {
+            assert_eq!(evaluate(&board), 0);
         }
     }
 

@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (63 unit tests covering protocol, state, evaluation, search)
+# Test (86 unit tests covering protocol, state, evaluation, search)
 cargo test
 ```
 
@@ -137,10 +137,11 @@ Define the protocols and set up the project skeleton before the engine can play 
 The minimum viable engine. Parses UBI commands, maintains board state via BFEN, generates all legal moves (regular + drops), picks one at random, and returns `bestmove`. This validates the entire pipeline: UBI protocol ↔ BFEN parsing ↔ move generation ↔ bestmove response.
 
 **Implemented:**
-- `ubi.rs` — UBI protocol parser & formatter (28 unit tests)
+- `ubi.rs` — UBI protocol parser & formatter (30 unit tests, including `partnermsg`)
 - `game_state.rs` — engine state, command dispatch, random move selection (18 unit tests)
 - `main.rs` — thin I/O loop with BufWriter for efficient stdout
 - Full UBI handshake (`ubi`/`ubiok`), position setup (`startpos` / `bfen`), clock tracking, `go` / `stop` / `quit`
+- `partnermsg` command parsing (acknowledged for future partner coordination)
 - Drop moves from reserves with UBI-compliant lowercase notation (`p@e4`, `n@f3`)
 
 ### Phase C — Static evaluation + 1-ply search (complete)
@@ -156,11 +157,12 @@ Replace random selection with a scored evaluation function and 1-ply search. The
   - King safety: pawn shield, open files, attacker count, reserve amplifier
   - Mobility: piece attack squares (knights, bishops, rooks, queens)
   - Pawn structure: doubled, isolated, and passed pawn detection
-  - King capturable terminal detection (+30000)
-- `search.rs` — 1-ply negamax search (6 unit tests) with:
+  - Checkmate/stalemate terminal detection (+30000/0)
+- `search.rs` — 1-ply negamax search (12 unit tests) with:
   - Score-based move selection across regular moves and drops
   - Drop pruning: generates drops only on ~30-50 relevant squares (attack zone, defense zone, center, promotion zone) instead of all ~200+ empty squares
-  - King capture shortcut and self-capture avoidance (-30000)
+  - Checkmate detection (score +30000 for mating opponent)
+  - All moves guaranteed legal by the library (no self-check, pins enforced)
 - `game_state.rs` — wired search into `handle_go()`, reports depth 1 with actual score and node count
 
 ### Phase D — Real search
@@ -268,8 +270,9 @@ This framework maps onto the existing roadmap:
 The engine uses [bughouse-chess](https://github.com/vcsawant/bughouse-chess) — a Rust move generation library forked from [jordanbray/chess](https://github.com/jordanbray/chess) and adapted for bughouse rules. It provides:
 
 - Bitboard-based board representation with reserves and promoted-piece tracking
-- Legal move generation (all piece moves + castling, no check/pin filtering per bughouse rules)
-- Drop move generation from reserves (pawn rank restrictions enforced)
+- Legal move generation with full check/pin enforcement (king cannot move into check, pinned pieces restricted, castling through check forbidden)
+- Drop move generation from reserves with check-aware filtering (drops can block sliding checks; no drops in double check)
+- Bughouse-aware checkmate detection: only unblockable checks (knight, adjacent, double check) are checkmate — distant sliding checks with empty blocking squares remain ongoing (partner can send pieces)
 - BFEN parsing and emission (reserves in `[]` brackets, promoted pieces with `~` suffix)
 - Capture tracking with promoted-piece demotion
 - Zobrist hashing that includes reserve state

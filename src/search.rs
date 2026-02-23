@@ -26,14 +26,9 @@ pub struct SearchResult {
 
 /// Find the best move for the current position using 1-ply search.
 ///
-/// Returns `None` if there are no legal moves.
+/// Returns `None` if there are no legal moves (checkmate or stalemate).
 /// `_play_style` is accepted for future use (search depth, time budget).
 pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchResult> {
-    // If king is already capturable, find the capture
-    if board.status() == BoardStatus::KingCapturable {
-        return find_king_capture(board);
-    }
-
     let mut best_move: Option<BughouseMove> = None;
     let mut best_score = i32::MIN;
     let mut nodes = 0usize;
@@ -64,13 +59,13 @@ pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchRes
     // Evaluate pruned drop moves
     let drop_mask = build_drop_mask(board);
     let us = board.side_to_move();
-    let reserves = board.reserves(us);
+    let reserve = &board.reserves()[us.to_index()];
     let combined = *board.combined();
     let empty_targets = drop_mask & !combined;
 
     let mut drop_count = 0usize;
 
-    for (piece, count) in reserves.iter() {
+    for (piece, count) in reserve.iter() {
         if count == 0 || piece == Piece::King {
             continue;
         }
@@ -123,33 +118,17 @@ pub fn find_best_move(board: &Board, _play_style: PlayStyle) -> Option<SearchRes
 }
 
 /// Score a child position from the parent's perspective (negamax).
-/// If the child position has king capturable, that means we left our king
-/// hanging — score it very negatively.
+///
+/// After we make a move, the child position is from the opponent's perspective.
+/// We negate the evaluation to get our score.
+/// Checkmate in the child = the opponent is checkmated = great for us (+30000).
+/// Stalemate = draw (0).
 fn score_child(child: &Board) -> i32 {
-    if child.status() == BoardStatus::KingCapturable {
-        // Opponent can capture our king — this move is terrible
-        return -30000;
+    match child.status() {
+        BoardStatus::Checkmate => 30000,   // We checkmated them
+        BoardStatus::Stalemate => 0,       // Draw
+        BoardStatus::Ongoing => -scoring::evaluate(child),
     }
-    -scoring::evaluate(child)
-}
-
-/// When king is already capturable, find any move that captures it.
-fn find_king_capture(board: &Board) -> Option<SearchResult> {
-    let opponent = !board.side_to_move();
-    let king_sq = board.king_square(opponent);
-
-    for cm in MoveGen::new_legal(board) {
-        if cm.get_dest() == king_sq {
-            let m = BughouseMove::Regular(cm);
-            return Some(SearchResult {
-                pv: vec![format!("{}", m)],
-                best_move: m,
-                score: 30000,
-                nodes: 1,
-            });
-        }
-    }
-    None
 }
 
 /// Build the drop mask: a BitBoard of squares where drops are worth considering.
@@ -238,33 +217,41 @@ mod tests {
     }
 
     #[test]
-    fn captures_king_when_capturable() {
-        // Position where king is capturable — a queen is next to the enemy king
+    fn finds_checkmate_move() {
+        // White to move: Qh5 + Pf6, black Kg8 + pawns f7/g7/h7.
+        // Qh5-h7# is mate: queen adjacent on h7, defended by nothing but
+        // king can't escape (g8 = pawn on g7 blocks, f8 = pawn on f6... hmm).
+        // Simpler: White Qd1, Rh1, Kg1. Black Kg8, Rf8, g7, h7, f7.
+        // Qd1-d8 is back-rank mate (but it's a distant check, drop-blockable in bughouse).
+        // For a true bughouse checkmate, need adjacent/knight check.
+        // Use: White Kc1, Qg5, Pf6. Black Kg8, Pf7, Pg7, Ph7.
+        // Qg5-g7# — but pawn on g7 is in the way. Hmm.
+        // Simplest: White Kh1, Qg6. Black Kh8, Ph7. Qg6-g7# adjacent queen mate.
+        // g7 is defended by Qg6's move. Wait, the queen MOVES to g7, it's not defended there.
+        // We need defense. White Kh1, Qg6, Bf6. Black Kh8, Ph7.
+        // Qg6-g7# — queen on g7 defended by bishop f6 (which attacks g7). Adjacent check. Mate!
         let board: Board =
-            "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBqKBNR[] w KQkq - 0 1"
+            "7k/7p/5BQ1/8/8/8/8/7K[] w - - 0 1"
                 .parse()
                 .unwrap();
-        if board.status() == BoardStatus::KingCapturable {
-            let result = find_best_move(&board, PlayStyle::Blitz).unwrap();
-            assert_eq!(result.score, 30000);
-        }
+        let result = find_best_move(&board, PlayStyle::Blitz).unwrap();
+        assert_eq!(result.score, 30000, "Engine should find the Qg7# checkmate");
     }
 
     #[test]
-    fn avoids_losing_king() {
-        // After a move, if our king would be capturable, avoid that move
-        // This is tested implicitly: score_child returns -30000 for such positions
+    fn best_move_is_legal() {
+        // Verify the engine's chosen move doesn't leave king in check
+        // (guaranteed by legal move generation, but good sanity check).
         let board = Board::default();
         let result = find_best_move(&board, PlayStyle::Blitz).unwrap();
-        // The chosen move should not leave king capturable
         let new_board = match result.best_move {
             BughouseMove::Regular(cm) => board.make_move_new(cm),
             BughouseMove::Drop { piece, square } => board.make_drop_new(piece, square).unwrap(),
         };
         assert_ne!(
             new_board.status(),
-            BoardStatus::KingCapturable,
-            "best move should not leave king capturable"
+            BoardStatus::Checkmate,
+            "best move should not result in immediate checkmate of ourselves"
         );
     }
 
@@ -430,16 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn score_child_penalizes_king_capturable() {
-        // If a child position has king capturable, score_child returns -30000
+    fn score_child_rewards_checkmate() {
+        // If a child position is checkmate (opponent is mated), score_child returns +30000
         let board: Board =
-            "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBqKBNR[] w KQkq - 0 1"
+            "7k/6Q1/5P2/8/8/8/8/K7[] b - - 0 1"
                 .parse()
                 .unwrap();
-        if board.status() == BoardStatus::KingCapturable {
-            // From the parent's perspective, this child is terrible
+        if board.status() == BoardStatus::Checkmate {
             let score = score_child(&board);
-            assert_eq!(score, -30000);
+            assert_eq!(score, 30000, "Checkmating the opponent should score +30000");
         }
     }
 }

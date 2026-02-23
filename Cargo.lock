@@ -91,7 +91,7 @@ dependencies = [
 [[package]]
 name = "bughouse-chess"
 version = "0.1.0"
-source = "git+https://github.com/vcsawant/bughouse-chess?branch=main#26062ee8c4f73ff51a2929cf69c3657fec9f67b5"
+source = "git+https://github.com/vcsawant/bughouse-chess.git?branch=main#61c5fbbe966d17cc85750ac63594dba867f55bb2"
 dependencies = [
  "arrayvec",
  "failure",

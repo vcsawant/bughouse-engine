@@ -3,7 +3,7 @@
 //! This module is pure data transformation — no I/O.
 //! It converts between text lines and typed command/response enums.
 
-use bughouse_chess::{BughouseMove, Color};
+use bughouse_chess::BughouseMove;
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -14,14 +14,7 @@ pub enum BoardId {
     B,
 }
 
-/// Identifies a specific player's clock (color + board).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClockTarget {
-    pub color: Color,
-    pub board: BoardId,
-}
-
-/// How the position is specified in a `position` command.
+/// How a board's position is specified in a `position` command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PositionSpec {
     StartPos,
@@ -35,10 +28,16 @@ pub enum UbiCommand {
     IsReady,
     UbiNewGame,
     SetOption { name: String, value: Option<String> },
-    Position { board: BoardId, fen: PositionSpec, moves: Vec<String> },
-    Clock { target: ClockTarget, millis: u64 },
+    /// Atomic position: both boards + all four clocks.
+    /// Format: `position <bfen_a> | <bfen_b> clock <wA> <bA> <wB> <bB>`
+    Position {
+        board_a: PositionSpec,
+        board_b: PositionSpec,
+        clocks: [u64; 4],  // [white_A, black_A, white_B, black_B]
+    },
     Go { board: BoardId },
     Stop { board: Option<BoardId> },
+    PartnerMsg(String),
     Quit,
     Unknown(String),
 }
@@ -66,35 +65,39 @@ fn parse_board_id(s: &str) -> Result<BoardId, String> {
     }
 }
 
-/// Parse a clock target token like "white_A" or "black_B".
-fn parse_clock_target(s: &str) -> Result<ClockTarget, String> {
-    match s {
-        "white_A" => Ok(ClockTarget { color: Color::White, board: BoardId::A }),
-        "black_A" => Ok(ClockTarget { color: Color::Black, board: BoardId::A }),
-        "white_B" => Ok(ClockTarget { color: Color::White, board: BoardId::B }),
-        "black_B" => Ok(ClockTarget { color: Color::Black, board: BoardId::B }),
-        _ => Err(format!("invalid clock target: {}", s)),
-    }
-}
-
 /// Parse one line of stdin into a UbiCommand.
 pub fn parse_command(line: &str) -> Result<UbiCommand, String> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.is_empty() {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
         return Err("empty command".to_string());
     }
 
-    match tokens[0] {
+    // Determine the command keyword from the first token
+    let keyword = trimmed.split_whitespace().next().unwrap();
+
+    match keyword {
         "ubi" => Ok(UbiCommand::Ubi),
         "isready" => Ok(UbiCommand::IsReady),
         "ubinewgame" => Ok(UbiCommand::UbiNewGame),
         "quit" => Ok(UbiCommand::Quit),
 
-        "setoption" => parse_setoption(&tokens),
-        "position" => parse_position(&tokens),
-        "clock" => parse_clock(&tokens),
-        "go" => parse_go(&tokens),
-        "stop" => parse_stop(&tokens),
+        "setoption" => {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            parse_setoption(&tokens)
+        }
+        "position" => parse_position(trimmed),
+        "go" => {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            parse_go(&tokens)
+        }
+        "stop" => {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            parse_stop(&tokens)
+        }
+        "partnermsg" => {
+            let body = trimmed.strip_prefix("partnermsg").unwrap().trim().to_string();
+            Ok(UbiCommand::PartnerMsg(body))
+        }
 
         _ => Ok(UbiCommand::Unknown(line.to_string())),
     }
@@ -119,52 +122,59 @@ fn parse_setoption(tokens: &[&str]) -> Result<UbiCommand, String> {
     Ok(UbiCommand::SetOption { name, value })
 }
 
-/// Parse: `position board <A|B> <startpos|bfen <6-field-string>> [moves <move1> ...]`
-fn parse_position(tokens: &[&str]) -> Result<UbiCommand, String> {
-    // tokens[0] = "position", tokens[1] = "board", tokens[2] = board id
-    if tokens.len() < 4 || tokens[1] != "board" {
-        return Err("position: expected 'board <A|B>'".to_string());
-    }
-    let board = parse_board_id(tokens[2])?;
-
-    match tokens[3] {
-        "startpos" => {
-            // Check for optional "moves" section
-            let moves = if tokens.len() > 4 && tokens[4] == "moves" {
-                tokens[5..].iter().map(|s| s.to_string()).collect()
-            } else {
-                Vec::new()
-            };
-            Ok(UbiCommand::Position { board, fen: PositionSpec::StartPos, moves })
+/// Parse a board spec string: either "startpos" or a 6-field BFEN string.
+fn parse_board_spec(s: &str) -> Result<PositionSpec, String> {
+    let trimmed = s.trim();
+    if trimmed == "startpos" {
+        Ok(PositionSpec::StartPos)
+    } else {
+        // Validate it has 6 space-separated fields
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        if fields.len() != 6 {
+            return Err(format!("position: expected 'startpos' or 6-field BFEN, got {} fields: '{}'", fields.len(), trimmed));
         }
-        "bfen" => {
-            // BFEN has exactly 6 space-separated fields
-            if tokens.len() < 10 {
-                return Err("position bfen: expected 6 fields".to_string());
-            }
-            let bfen = tokens[4..10].join(" ");
-
-            // Check for optional "moves" section after the 6 BFEN fields
-            let moves = if tokens.len() > 10 && tokens[10] == "moves" {
-                tokens[11..].iter().map(|s| s.to_string()).collect()
-            } else {
-                Vec::new()
-            };
-            Ok(UbiCommand::Position { board, fen: PositionSpec::Bfen(bfen), moves })
-        }
-        other => Err(format!("position: expected 'startpos' or 'bfen', got '{}'", other)),
+        Ok(PositionSpec::Bfen(trimmed.to_string()))
     }
 }
 
-/// Parse: `clock <color_board> <milliseconds>`
-fn parse_clock(tokens: &[&str]) -> Result<UbiCommand, String> {
-    if tokens.len() < 3 {
-        return Err("clock: expected <target> <millis>".to_string());
+/// Parse: `position <bfen_a> | <bfen_b> clock <wA> <bA> <wB> <bB>`
+///
+/// Uses substring search rather than token splitting because BFEN strings
+/// contain spaces. The `|` character never appears in valid BFEN, so
+/// `find(" | ")` is unambiguous.
+fn parse_position(line: &str) -> Result<UbiCommand, String> {
+    // Strip "position " prefix
+    let rest = line.strip_prefix("position ")
+        .ok_or("position: missing command body")?;
+
+    // Split at " | " to get board A spec and the remainder
+    let pipe_pos = rest.find(" | ")
+        .ok_or("position: missing ' | ' separator between boards")?;
+    let board_a_str = &rest[..pipe_pos];
+    let after_pipe = &rest[pipe_pos + 3..]; // skip " | "
+
+    // Split at " clock " to get board B spec and clock values
+    let clock_pos = after_pipe.find(" clock ")
+        .ok_or("position: missing ' clock ' after board B")?;
+    let board_b_str = &after_pipe[..clock_pos];
+    let clock_str = &after_pipe[clock_pos + 7..]; // skip " clock "
+
+    // Parse board specs
+    let board_a = parse_board_spec(board_a_str)?;
+    let board_b = parse_board_spec(board_b_str)?;
+
+    // Parse 4 clock values
+    let clock_tokens: Vec<&str> = clock_str.split_whitespace().collect();
+    if clock_tokens.len() != 4 {
+        return Err(format!("position: expected 4 clock values, got {}", clock_tokens.len()));
     }
-    let target = parse_clock_target(tokens[1])?;
-    let millis = tokens[2].parse::<u64>()
-        .map_err(|e| format!("clock: invalid millis: {}", e))?;
-    Ok(UbiCommand::Clock { target, millis })
+    let mut clocks = [0u64; 4];
+    for (i, tok) in clock_tokens.iter().enumerate() {
+        clocks[i] = tok.parse::<u64>()
+            .map_err(|e| format!("position: invalid clock value '{}': {}", tok, e))?;
+    }
+
+    Ok(UbiCommand::Position { board_a, board_b, clocks })
 }
 
 /// Parse: `go board <A|B> [ignored params]`
@@ -270,69 +280,89 @@ mod tests {
     }
 
     #[test]
-    fn parse_position_startpos() {
-        let cmd = parse_command("position board A startpos").unwrap();
+    fn parse_position_both_startpos() {
+        let cmd = parse_command(
+            "position startpos | startpos clock 180000 180000 180000 180000"
+        ).unwrap();
         assert_eq!(cmd, UbiCommand::Position {
-            board: BoardId::A,
-            fen: PositionSpec::StartPos,
-            moves: vec![],
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 180000, 180000, 180000],
         });
     }
 
     #[test]
-    fn parse_position_bfen() {
+    fn parse_position_both_bfen() {
         let cmd = parse_command(
-            "position board B bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1"
+            "position rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1 | rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1 clock 180000 175000 182000 178000"
         ).unwrap();
         assert_eq!(cmd, UbiCommand::Position {
-            board: BoardId::B,
-            fen: PositionSpec::Bfen(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1".to_string()
-            ),
-            moves: vec![],
-        });
-    }
-
-    #[test]
-    fn parse_position_bfen_with_moves() {
-        let cmd = parse_command(
-            "position board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1 moves e2e4 d7d5"
-        ).unwrap();
-        assert_eq!(cmd, UbiCommand::Position {
-            board: BoardId::A,
-            fen: PositionSpec::Bfen(
+            board_a: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1".to_string()
             ),
-            moves: vec!["e2e4".to_string(), "d7d5".to_string()],
+            board_b: PositionSpec::Bfen(
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1".to_string()
+            ),
+            clocks: [180000, 175000, 182000, 178000],
         });
     }
 
     #[test]
-    fn parse_position_startpos_with_drop() {
-        let cmd = parse_command("position board A startpos moves e2e4 n@f3").unwrap();
+    fn parse_position_mixed_startpos_bfen() {
+        let cmd = parse_command(
+            "position startpos | rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR[] b KQkq - 0 1 clock 180000 180000 177000 180000"
+        ).unwrap();
         assert_eq!(cmd, UbiCommand::Position {
-            board: BoardId::A,
-            fen: PositionSpec::StartPos,
-            moves: vec!["e2e4".to_string(), "n@f3".to_string()],
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::Bfen(
+                "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR[] b KQkq - 0 1".to_string()
+            ),
+            clocks: [180000, 180000, 177000, 180000],
         });
     }
 
     #[test]
-    fn parse_clock_white_a() {
-        let cmd = parse_command("clock white_A 180000").unwrap();
-        assert_eq!(cmd, UbiCommand::Clock {
-            target: ClockTarget { color: Color::White, board: BoardId::A },
-            millis: 180000,
+    fn parse_position_with_reserves() {
+        let cmd = parse_command(
+            "position r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[NNPp] w KQkq - 4 5 | rnbqkb1r/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR[Qbpp] b KQkq - 0 3 clock 165000 168000 170000 172000"
+        ).unwrap();
+        assert_eq!(cmd, UbiCommand::Position {
+            board_a: PositionSpec::Bfen(
+                "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[NNPp] w KQkq - 4 5".to_string()
+            ),
+            board_b: PositionSpec::Bfen(
+                "rnbqkb1r/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR[Qbpp] b KQkq - 0 3".to_string()
+            ),
+            clocks: [165000, 168000, 170000, 172000],
         });
     }
 
     #[test]
-    fn parse_clock_black_b() {
-        let cmd = parse_command("clock black_B 175000").unwrap();
-        assert_eq!(cmd, UbiCommand::Clock {
-            target: ClockTarget { color: Color::Black, board: BoardId::B },
-            millis: 175000,
-        });
+    fn parse_position_missing_pipe() {
+        assert!(parse_command(
+            "position startpos startpos clock 180000 180000 180000 180000"
+        ).is_err());
+    }
+
+    #[test]
+    fn parse_position_missing_clock() {
+        assert!(parse_command(
+            "position startpos | startpos 180000 180000 180000 180000"
+        ).is_err());
+    }
+
+    #[test]
+    fn parse_position_wrong_clock_count() {
+        assert!(parse_command(
+            "position startpos | startpos clock 180000 180000 180000"
+        ).is_err());
+    }
+
+    #[test]
+    fn parse_position_invalid_clock_value() {
+        assert!(parse_command(
+            "position startpos | startpos clock 180000 abc 180000 180000"
+        ).is_err());
     }
 
     #[test]
@@ -361,6 +391,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_partnermsg() {
+        let cmd = parse_command("partnermsg need n urgency high").unwrap();
+        assert_eq!(cmd, UbiCommand::PartnerMsg("need n urgency high".to_string()));
+    }
+
+    #[test]
+    fn parse_partnermsg_empty_body() {
+        let cmd = parse_command("partnermsg").unwrap();
+        assert_eq!(cmd, UbiCommand::PartnerMsg("".to_string()));
+    }
+
+    #[test]
     fn parse_unknown() {
         let cmd = parse_command("garbage xyz").unwrap();
         assert_eq!(cmd, UbiCommand::Unknown("garbage xyz".to_string()));
@@ -369,18 +411,6 @@ mod tests {
     #[test]
     fn parse_empty() {
         assert!(parse_command("").is_err());
-    }
-
-    #[test]
-    fn parse_invalid_board_id() {
-        assert!(parse_command(
-            "position board C bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1"
-        ).is_err());
-    }
-
-    #[test]
-    fn parse_invalid_clock() {
-        assert!(parse_command("clock purple_Z 100").is_err());
     }
 
     // --- Formatting tests ---
@@ -452,6 +482,15 @@ mod tests {
     }
 
     #[test]
+    fn format_bestmove_none() {
+        let resp = UbiResponse::BestMove {
+            board: BoardId::A,
+            move_str: "(none)".to_string(),
+        };
+        assert_eq!(format_response(&resp), "bestmove board A (none)");
+    }
+
+    #[test]
     fn format_move_regular() {
         use bughouse_chess::ChessMove;
         let from = Square::from_str("e2").unwrap();
@@ -462,7 +501,7 @@ mod tests {
 
     #[test]
     fn format_move_drop() {
-        let m = BughouseMove::drop_piece(Piece::Pawn, Square::from_str("e4").unwrap());
+        let m = BughouseMove::Drop { piece: Piece::Pawn, square: Square::from_str("e4").unwrap() };
         assert_eq!(format_move(&m), "p@e4");
     }
 }

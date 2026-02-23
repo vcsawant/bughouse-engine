@@ -2,14 +2,14 @@
 
 ## What this is
 
-A Rust bughouse chess engine that communicates over stdin/stdout using the UBI protocol and understands BFEN notation. Currently at Phase B (random-move bot). See `README.md` for full architecture and roadmap.
+A Rust bughouse chess engine that communicates over stdin/stdout using the UBI protocol and understands BFEN notation. Currently at Phase C (1-ply search with static evaluation). See `README.md` for full architecture and roadmap.
 
 ## Build & test
 
 ```bash
 cargo build              # debug build
 cargo build --release    # optimized build
-cargo test               # run all unit tests (46 currently)
+cargo test               # run all unit tests (86 currently)
 cargo run                # interactive mode — type UBI commands, Ctrl-D to exit
 ```
 
@@ -24,7 +24,7 @@ src/
 ├── game_state.rs    # EngineState, command dispatch, move selection (no I/O)
 ├── strategy.rs      # PlayStyle enum + time-aware style selection
 ├── scoring.rs       # Static evaluation function (material, PSTs, king safety, etc.)
-└── search.rs        # 1-ply search with drop pruning
+└── search.rs        # 1-ply search with drop pruning, checkmate scoring
 docs/
 ├── BFEN.md          # Bughouse FEN spec v0.1 (authoritative)
 └── UBI.md           # Universal Bughouse Interface spec v0.1 (authoritative)

@@ -6,13 +6,13 @@
 
 use std::time::Instant;
 
-use bughouse_chess::{Board, BughouseMove};
+use bughouse_chess::Board;
 use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 
 use crate::search;
 use crate::strategy;
-use crate::ubi::{BoardId, UbiCommand, UbiResponse, ClockTarget, PositionSpec, format_move};
+use crate::ubi::{BoardId, UbiCommand, UbiResponse, PositionSpec, format_move};
 
 // ─── Engine State ────────────────────────────────────────────────────
 
@@ -43,24 +43,10 @@ impl EngineState {
     pub fn board(&self, id: BoardId) -> Option<&Board> {
         self.boards[board_index(id)].as_ref()
     }
-
-    /// Get the clock value for a specific player.
-    pub fn clock(&self, target: &ClockTarget) -> u64 {
-        self.clocks[clock_index(target)]
-    }
 }
 
 fn board_index(id: BoardId) -> usize {
     match id { BoardId::A => 0, BoardId::B => 1 }
-}
-
-fn clock_index(target: &ClockTarget) -> usize {
-    let board_off = match target.board { BoardId::A => 0, BoardId::B => 2 };
-    let color_off = match target.color {
-        bughouse_chess::Color::White => 0,
-        bughouse_chess::Color::Black => 1,
-    };
-    board_off + color_off
 }
 
 // ─── Command Dispatch ────────────────────────────────────────────────
@@ -84,19 +70,21 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
 
         UbiCommand::SetOption { .. } => vec![],
 
-        UbiCommand::Position { board, fen, moves } => {
-            handle_position(state, *board, fen, moves);
-            vec![]
-        }
-
-        UbiCommand::Clock { target, millis } => {
-            state.clocks[clock_index(target)] = *millis;
+        UbiCommand::Position { board_a, board_b, clocks } => {
+            handle_position_board(state, BoardId::A, board_a);
+            handle_position_board(state, BoardId::B, board_b);
+            state.clocks = *clocks;
             vec![]
         }
 
         UbiCommand::Go { board } => handle_go(state, *board),
 
         UbiCommand::Stop { .. } => vec![],
+
+        UbiCommand::PartnerMsg(msg) => {
+            debug!("[game:{}] Partner message: {}", state.game_id, msg);
+            vec![]  // Acknowledged, no response (future: influence search)
+        }
 
         UbiCommand::Quit => vec![],
 
@@ -109,8 +97,8 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
 
 // ─── Position handling ───────────────────────────────────────────────
 
-fn handle_position(state: &mut EngineState, board_id: BoardId, fen: &PositionSpec, moves: &[String]) {
-    let mut board = match fen {
+fn handle_position_board(state: &mut EngineState, board_id: BoardId, spec: &PositionSpec) {
+    let board = match spec {
         PositionSpec::StartPos => {
             debug!("[game:{}] Board {:?} set to startpos", state.game_id, board_id);
             Board::default()
@@ -126,25 +114,6 @@ fn handle_position(state: &mut EngineState, board_id: BoardId, fen: &PositionSpe
             }
         },
     };
-
-    for move_str in moves {
-        match move_str.parse::<BughouseMove>() {
-            Ok(BughouseMove::Regular(cm)) => {
-                board = board.make_move_new(cm);
-            }
-            Ok(BughouseMove::Drop { piece, square }) => {
-                match board.make_drop_new(piece, square) {
-                    Some(new_board) => board = new_board,
-                    None => {
-                        warn!("[game:{}] Illegal drop: {}", state.game_id, move_str);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("[game:{}] Invalid move '{}': {}", state.game_id, move_str, e);
-            }
-        }
-    }
 
     state.boards[board_index(board_id)] = Some(board);
 }
@@ -167,7 +136,12 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
         Some(r) => r,
         None => {
             warn!("[game:{}] No legal moves on board {:?}", state.game_id, board_id);
-            return vec![];
+            return vec![
+                UbiResponse::BestMove {
+                    board: board_id,
+                    move_str: "(none)".to_string(),
+                },
+            ];
         }
     };
 
@@ -221,12 +195,20 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ubi::{BoardId, UbiCommand, UbiResponse, ClockTarget, PositionSpec};
-    use bughouse_chess::{BughouseMove, Color, MoveGen, Piece, Square};
-    use std::str::FromStr;
+    use crate::ubi::{BoardId, UbiCommand, UbiResponse, PositionSpec};
+    use bughouse_chess::{BughouseMove, Color, MoveGen, Piece};
 
     fn new_state() -> EngineState {
         EngineState::new("test".to_string())
+    }
+
+    /// Helper: send a position command with both boards at startpos and default clocks.
+    fn set_startpos(state: &mut EngineState) {
+        process_command(state, &UbiCommand::Position {
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 180000, 180000, 180000],
+        });
     }
 
     #[test]
@@ -250,10 +232,8 @@ mod tests {
     fn ubinewgame_resets() {
         let mut state = new_state();
         // Set up some state
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
-        });
-        state.clocks = [100, 200, 300, 400];
+        set_startpos(&mut state);
+        assert!(state.board(BoardId::A).is_some());
 
         // Reset
         process_command(&mut state, &UbiCommand::UbiNewGame);
@@ -263,93 +243,40 @@ mod tests {
     }
 
     #[test]
-    fn position_startpos() {
+    fn position_sets_both_boards_and_clocks() {
         let mut state = new_state();
         process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 175000, 182000, 178000],
         });
-        let board = state.board(BoardId::A).unwrap();
-        assert_eq!(*board, Board::default());
+        assert_eq!(*state.board(BoardId::A).unwrap(), Board::default());
+        assert_eq!(*state.board(BoardId::B).unwrap(), Board::default());
+        assert_eq!(state.clocks, [180000, 175000, 182000, 178000]);
     }
 
     #[test]
     fn position_bfen_with_reserves() {
         let mut state = new_state();
         process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A,
-            fen: PositionSpec::Bfen(
+            board_a: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1".to_string()
             ),
-            moves: vec![],
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 180000, 180000, 180000],
         });
         let board = state.board(BoardId::A).unwrap();
-        assert_eq!(board.reserves(Color::White).count(Piece::Queen), 1);
-        assert_eq!(board.reserves(Color::White).count(Piece::Knight), 1);
-        assert_eq!(board.reserves(Color::White).count(Piece::Pawn), 1);
-        assert_eq!(board.reserves(Color::Black).count(Piece::Queen), 1);
-        assert_eq!(board.reserves(Color::Black).count(Piece::Pawn), 1);
-    }
-
-    #[test]
-    fn position_with_regular_moves() {
-        let mut state = new_state();
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A,
-            fen: PositionSpec::StartPos,
-            moves: vec!["e2e4".to_string(), "d7d5".to_string()],
-        });
-        let board = state.board(BoardId::A).unwrap();
-        // After e2e4 d7d5, it's white to move
-        assert_eq!(board.side_to_move(), Color::White);
-        // e4 should have a pawn, d5 should have a pawn
-        assert!(board.piece_on(Square::from_str("e4").unwrap()).is_some());
-        assert!(board.piece_on(Square::from_str("d5").unwrap()).is_some());
-        // e2 and d7 should be empty
-        assert!(board.piece_on(Square::from_str("e2").unwrap()).is_none());
-        assert!(board.piece_on(Square::from_str("d7").unwrap()).is_none());
-    }
-
-    #[test]
-    fn position_with_drop_moves() {
-        let mut state = new_state();
-        // Use a BFEN with knight in white's reserve, white to move
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::B,
-            fen: PositionSpec::Bfen(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQkq - 0 1".to_string()
-            ),
-            moves: vec!["n@e4".to_string()],
-        });
-        let board = state.board(BoardId::B).unwrap();
-        // Knight should be on e4
-        assert_eq!(board.piece_on(Square::from_str("e4").unwrap()), Some(Piece::Knight));
-        // Reserve should be decremented
-        assert_eq!(board.reserves(Color::White).count(Piece::Knight), 0);
-    }
-
-    #[test]
-    fn clock_updates() {
-        let mut state = new_state();
-        let targets = [
-            (ClockTarget { color: Color::White, board: BoardId::A }, 180000u64),
-            (ClockTarget { color: Color::Black, board: BoardId::A }, 175000u64),
-            (ClockTarget { color: Color::White, board: BoardId::B }, 182000u64),
-            (ClockTarget { color: Color::Black, board: BoardId::B }, 178000u64),
-        ];
-        for (target, millis) in &targets {
-            process_command(&mut state, &UbiCommand::Clock { target: *target, millis: *millis });
-        }
-        for (target, millis) in &targets {
-            assert_eq!(state.clock(target), *millis);
-        }
+        assert_eq!(board.reserves()[Color::White.to_index()].count(Piece::Queen), 1);
+        assert_eq!(board.reserves()[Color::White.to_index()].count(Piece::Knight), 1);
+        assert_eq!(board.reserves()[Color::White.to_index()].count(Piece::Pawn), 1);
+        assert_eq!(board.reserves()[Color::Black.to_index()].count(Piece::Queen), 1);
+        assert_eq!(board.reserves()[Color::Black.to_index()].count(Piece::Pawn), 1);
     }
 
     #[test]
     fn go_produces_teammsg_info_and_bestmove() {
         let mut state = new_state();
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
-        });
+        set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         assert_eq!(resp.len(), 3);
         assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
@@ -360,9 +287,7 @@ mod tests {
     #[test]
     fn go_bestmove_is_legal() {
         let mut state = new_state();
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
-        });
+        set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         let move_str = match &resp[2] {
             UbiResponse::BestMove { move_str, .. } => move_str.clone(),
@@ -391,14 +316,12 @@ mod tests {
     fn go_includes_drops() {
         let mut state = new_state();
         // Position where white has pieces in reserve — drops should be possible
-        // Use an empty-ish board where we block all regular moves but have reserves
-        // Simpler: just set up a position with reserves and verify drops are in the count
         process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A,
-            fen: PositionSpec::Bfen(
+            board_a: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQkq - 0 1".to_string()
             ),
-            moves: vec![],
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 180000, 180000, 180000],
         });
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         // Starting position has 20 regular moves. With a knight in reserve,
@@ -414,9 +337,7 @@ mod tests {
     #[test]
     fn info_node_count() {
         let mut state = new_state();
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
-        });
+        set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         // Starting position: 20 regular moves, 0 drops (empty reserves)
         if let UbiResponse::Info { nodes, .. } = &resp[1] {
@@ -466,23 +387,8 @@ mod tests {
         let resp = process_command(&mut state, &UbiCommand::UbiNewGame);
         assert!(resp.is_empty());
 
-        // Set up both boards
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
-        });
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::B, fen: PositionSpec::StartPos, moves: vec![],
-        });
-
-        // Set clocks
-        process_command(&mut state, &UbiCommand::Clock {
-            target: ClockTarget { color: Color::White, board: BoardId::A },
-            millis: 180000,
-        });
-        process_command(&mut state, &UbiCommand::Clock {
-            target: ClockTarget { color: Color::Black, board: BoardId::A },
-            millis: 180000,
-        });
+        // Set up both boards with single position command
+        set_startpos(&mut state);
 
         // Go on board A
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
@@ -508,9 +414,7 @@ mod tests {
         let mut state = new_state();
 
         // Test regular move format (from starting position)
-        process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::A, fen: PositionSpec::StartPos, moves: vec![],
-        });
+        set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
         if let UbiResponse::BestMove { move_str, .. } = &resp[2] {
             // Regular UCI move: 4 chars like "e2e4" or 5 for promotion "e7e8q"
@@ -523,11 +427,11 @@ mod tests {
         // Position where a drop is clearly the best move: white has a queen in
         // reserve and an open board with few regular moves
         process_command(&mut state, &UbiCommand::Position {
-            board: BoardId::B,
-            fen: PositionSpec::Bfen(
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::Bfen(
                 "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR[Q] w KQkq - 0 1".to_string()
             ),
-            moves: vec![],
+            clocks: [180000, 180000, 180000, 180000],
         });
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
         if let UbiResponse::BestMove { move_str, .. } = &resp[2] {
@@ -541,4 +445,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn position_updates_clocks() {
+        let mut state = new_state();
+        process_command(&mut state, &UbiCommand::Position {
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 175000, 182000, 178000],
+        });
+        assert_eq!(state.clocks, [180000, 175000, 182000, 178000]);
+
+        // Update with new clocks
+        process_command(&mut state, &UbiCommand::Position {
+            board_a: PositionSpec::StartPos,
+            board_b: PositionSpec::StartPos,
+            clocks: [170000, 165000, 172000, 168000],
+        });
+        assert_eq!(state.clocks, [170000, 165000, 172000, 168000]);
+    }
 }

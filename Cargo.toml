@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bughouse-chess = { git = "https://github.com/vcsawant/bughouse-chess", branch = "main" }
+bughouse-chess = { git = "https://github.com/vcsawant/bughouse-chess.git", branch = "main" }
 rand = "0.8"
 log = "0.4"
 simplelog = "0.12"
