@@ -94,30 +94,22 @@ struct SearchContext {
 // ─── Move Generation ─────────────────────────────────────────────────
 
 /// Generate all legal moves (regular + pruned drops) for a position.
+///
+/// Regular moves come from the library's legal move generator. Drop moves
+/// use `MoveGen::drop_moves()` for legality (including check resolution),
+/// then filter through our drop mask for pruning irrelevant squares.
 fn generate_moves(board: &Board) -> Vec<BughouseMove> {
     let mut moves: Vec<BughouseMove> = MoveGen::new_legal(board)
         .map(BughouseMove::Regular)
         .collect();
 
-    // Add pruned drop moves
+    // Use library's legal drop generation, then prune to relevant squares
     let drop_mask = build_drop_mask(board);
-    let us = board.side_to_move();
-    let reserve = &board.reserves()[us.to_index()];
-    let combined = *board.combined();
-    let empty_targets = drop_mask & !combined;
-
-    for (piece, count) in reserve.iter() {
-        if count == 0 || piece == Piece::King {
-            continue;
-        }
-        for sq in empty_targets {
-            if piece == Piece::Pawn {
-                let rank = sq.get_rank();
-                if rank == Rank::First || rank == Rank::Eighth {
-                    continue;
-                }
+    for drop_move in MoveGen::drop_moves(board) {
+        if let BughouseMove::Drop { square, .. } = &drop_move {
+            if (drop_mask & BitBoard::from_square(*square)) != EMPTY {
+                moves.push(drop_move);
             }
-            moves.push(BughouseMove::Drop { piece, square: sq });
         }
     }
 
@@ -884,6 +876,26 @@ mod tests {
         let result = find_best_move_timed(&board, 2000, &mut info_sink);
         assert!(result.is_some(), "should find a move without crashing");
         assert!(result.unwrap().depth >= 1, "should complete at least depth 1");
+    }
+
+    #[test]
+    fn no_illegal_drops_while_in_check() {
+        // Reproduction of a real game bug: black king on e8 in check from Nf6,
+        // engine chose p@d7 which doesn't resolve the knight check.
+        // With the fix, drops that don't resolve check should not be generated.
+        let board: Board =
+            "r3kbr1/p1p2p1p/2p2Np1/1p2p3/Q5nq/2B1P3/PPPP1PPP/R1B1K2R[BNNPbbnnpp] b q - 1 18"
+                .parse()
+                .unwrap();
+        let moves = generate_moves(&board);
+        // No drop moves should appear — king is in check from a knight, which can't be blocked
+        for m in &moves {
+            if let BughouseMove::Drop { piece, square } = m {
+                panic!("illegal drop {:?}@{:?} generated while in knight check", piece, square);
+            }
+        }
+        // Should still have regular moves (king moves, captures of the knight)
+        assert!(!moves.is_empty(), "should have legal moves to resolve check");
     }
 
     #[test]
