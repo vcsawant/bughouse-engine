@@ -47,6 +47,23 @@ fn main() {
         }
     }
 
+    // Install panic hook that logs to the file logger before aborting.
+    // Without this, panics only print to stderr which the game server may not capture.
+    let hook_game_id = game_id.clone();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = info.payload()
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        log::error!("[game:{}] PANIC at {}: {}", hook_game_id, location, payload);
+        default_hook(info);
+    }));
+
     info!("[game:{}] Engine started", game_id);
 
     let stdin = io::stdin();

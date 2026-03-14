@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (104 unit tests covering protocol, state, evaluation, search, time)
+# Test (105 unit tests covering protocol, state, evaluation, search, time)
 cargo test
 ```
 

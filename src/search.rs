@@ -169,10 +169,28 @@ fn order_moves(board: &Board, moves: &mut [BughouseMove]) {
 
 // ─── Alpha-Beta Negamax ──────────────────────────────────────────────
 
-/// Make a move on the board, returning the new board (or None for illegal drops).
+/// Make a move on the board, returning the new board (or None for illegal/invalid moves).
+///
+/// Uses `catch_unwind` to guard against panics in the bughouse-chess library's
+/// `make_move_new`, which can panic on certain positions (e.g., `piece_on(source).unwrap()`
+/// on an empty square). This prevents the engine process from crashing during search.
 fn make_move(board: &Board, m: &BughouseMove) -> Option<Board> {
     match m {
-        BughouseMove::Regular(cm) => Some(board.make_move_new(*cm)),
+        BughouseMove::Regular(cm) => {
+            let cm = *cm;
+            let board = *board;
+            match std::panic::catch_unwind(move || board.make_move_new(cm)) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    let msg = e.downcast_ref::<String>()
+                        .map(|s| s.as_str())
+                        .or_else(|| e.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    log::error!("Panic in make_move_new for move {}: {}", cm, msg);
+                    None
+                }
+            }
+        }
         BughouseMove::Drop { piece, square } => board.make_drop_new(*piece, *square),
     }
 }
@@ -852,6 +870,20 @@ mod tests {
                 idx, stats.probability[0][idx]
             );
         }
+    }
+
+    #[test]
+    fn crash_position_from_game() {
+        // This position caused the engine to crash during a real game at depth 5.
+        // The crash was in make_move_new -> piece_on(source).unwrap() deep in the tree.
+        let board: Board =
+            "r1b2r1k/pppp1p1p/4pN1p/8/2PP4/2P5/PP2PPPP/nq1K1BR1[QBNP] w - - 3 25"
+                .parse()
+                .unwrap();
+        let mut info_sink = Vec::new();
+        let result = find_best_move_timed(&board, 2000, &mut info_sink);
+        assert!(result.is_some(), "should find a move without crashing");
+        assert!(result.unwrap().depth >= 1, "should complete at least depth 1");
     }
 
     #[test]
