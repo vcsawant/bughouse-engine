@@ -4,8 +4,6 @@
 //! `process_command()` which maps parsed UBI commands to responses.
 //! No I/O — all output is returned as `Vec<UbiResponse>`.
 
-use std::time::Instant;
-
 use bughouse_chess::Board;
 use log::{info, warn, debug};
 use rand::seq::SliceRandom;
@@ -118,7 +116,7 @@ fn handle_position_board(state: &mut EngineState, board_id: BoardId, spec: &Posi
     state.boards[board_index(board_id)] = Some(board);
 }
 
-// ─── Go handling (1-ply search) ──────────────────────────────────────
+// ─── Go handling (iterative deepening search) ───────────────────────
 
 fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let board = match &state.boards[board_index(board_id)] {
@@ -129,10 +127,12 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
         }
     };
 
-    let start = Instant::now();
+    let side = board.side_to_move();
+    let _play_style = strategy::determine_play_style(&state.clocks, board_id, side);
+    let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side);
 
-    let play_style = strategy::determine_play_style(&state.clocks);
-    let result = match search::find_best_move(board, play_style) {
+    let mut info_lines = Vec::new();
+    let result = match search::find_best_move_timed(board, budget_ms, &mut info_lines) {
         Some(r) => r,
         None => {
             warn!("[game:{}] No legal moves on board {:?}", state.game_id, board_id);
@@ -146,14 +146,14 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     };
 
     let chosen_str = format_move(&result.best_move);
-    let elapsed_ms = start.elapsed().as_millis() as u64;
 
     info!(
-        "[game:{}] Board {:?}: searched {} nodes, score {} cp, chose {} in {}ms",
-        state.game_id, board_id, result.nodes, result.score, chosen_str, elapsed_ms
+        "[game:{}] Board {:?}: depth {} searched {} nodes, score {} cp, chose {} in {}ms (budget {}ms)",
+        state.game_id, board_id, result.depth, result.nodes, result.score, chosen_str,
+        info_lines.last().map_or(0, |i| i.time_ms), budget_ms
     );
 
-    // Send a random team message before the best move (for testing bot→human comms)
+    // Build response: TeamMsg + per-depth Info lines + BestMove
     let team_msgs = [
         "need n urgency high",
         "need q urgency medium",
@@ -173,21 +173,25 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     ];
     let random_msg = team_msgs.choose(&mut state.rng).unwrap();
 
-    vec![
-        UbiResponse::TeamMsg(random_msg.to_string()),
-        UbiResponse::Info {
+    let mut responses = vec![UbiResponse::TeamMsg(random_msg.to_string())];
+
+    for info in &info_lines {
+        responses.push(UbiResponse::Info {
             board: board_id,
-            depth: 1,
-            nodes: result.nodes,
-            time_ms: elapsed_ms,
-            score_cp: result.score,
-            pv: result.pv,
-        },
-        UbiResponse::BestMove {
-            board: board_id,
-            move_str: chosen_str,
-        },
-    ]
+            depth: info.depth,
+            nodes: info.nodes,
+            time_ms: info.time_ms,
+            score_cp: info.score,
+            pv: info.pv.clone(),
+        });
+    }
+
+    responses.push(UbiResponse::BestMove {
+        board: board_id,
+        move_str: chosen_str,
+    });
+
+    responses
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -278,10 +282,11 @@ mod tests {
         let mut state = new_state();
         set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        assert_eq!(resp.len(), 3);
+        // TeamMsg + at least 1 Info line + BestMove
+        assert!(resp.len() >= 3, "expected at least 3 responses, got {}", resp.len());
         assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
         assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::A, .. }));
-        assert!(matches!(&resp[2], UbiResponse::BestMove { board: BoardId::A, .. }));
+        assert!(matches!(&resp[resp.len() - 1], UbiResponse::BestMove { board: BoardId::A, .. }));
     }
 
     #[test]
@@ -289,9 +294,9 @@ mod tests {
         let mut state = new_state();
         set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        let move_str = match &resp[2] {
+        let move_str = match &resp[resp.len() - 1] {
             UbiResponse::BestMove { move_str, .. } => move_str.clone(),
-            _ => panic!("expected BestMove"),
+            _ => panic!("expected BestMove as last response"),
         };
 
         // Parse the returned move and check it's in the legal move list
@@ -327,7 +332,9 @@ mod tests {
         // Starting position has 20 regular moves. With a knight in reserve,
         // the knight can drop on all empty squares (32 squares in middle 4 ranks).
         // Total should be > 20
-        if let UbiResponse::Info { nodes, .. } = &resp[1] {
+        // Check the deepest info line (second-to-last response)
+        let deepest_info = &resp[resp.len() - 2];
+        if let UbiResponse::Info { nodes, .. } = deepest_info {
             assert!(*nodes > 20, "expected drops to increase node count, got {}", nodes);
         } else {
             panic!("expected Info response");
@@ -339,9 +346,10 @@ mod tests {
         let mut state = new_state();
         set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        // Starting position: 20 regular moves, 0 drops (empty reserves)
-        if let UbiResponse::Info { nodes, .. } = &resp[1] {
-            assert_eq!(*nodes, 20);
+        // With iterative deepening, total nodes should be substantial
+        let deepest_info = &resp[resp.len() - 2];
+        if let UbiResponse::Info { nodes, .. } = deepest_info {
+            assert!(*nodes > 20, "should evaluate many nodes, got {}", nodes);
         } else {
             panic!("expected Info response");
         }
@@ -392,17 +400,17 @@ mod tests {
 
         // Go on board A
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        assert_eq!(resp.len(), 3);
+        assert!(resp.len() >= 3);
         assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
         assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::A, .. }));
-        assert!(matches!(&resp[2], UbiResponse::BestMove { board: BoardId::A, .. }));
+        assert!(matches!(&resp[resp.len() - 1], UbiResponse::BestMove { board: BoardId::A, .. }));
 
         // Go on board B
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
-        assert_eq!(resp.len(), 3);
+        assert!(resp.len() >= 3);
         assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
         assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::B, .. }));
-        assert!(matches!(&resp[2], UbiResponse::BestMove { board: BoardId::B, .. }));
+        assert!(matches!(&resp[resp.len() - 1], UbiResponse::BestMove { board: BoardId::B, .. }));
 
         // Quit
         let resp = process_command(&mut state, &UbiCommand::Quit);
@@ -416,7 +424,7 @@ mod tests {
         // Test regular move format (from starting position)
         set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        if let UbiResponse::BestMove { move_str, .. } = &resp[2] {
+        if let UbiResponse::BestMove { move_str, .. } = &resp[resp.len() - 1] {
             // Regular UCI move: 4 chars like "e2e4" or 5 for promotion "e7e8q"
             assert!(move_str.len() >= 4, "move too short: {}", move_str);
             // Should not contain '@' (no reserves in starting position)
@@ -434,7 +442,7 @@ mod tests {
             clocks: [180000, 180000, 180000, 180000],
         });
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
-        if let UbiResponse::BestMove { move_str, .. } = &resp[2] {
+        if let UbiResponse::BestMove { move_str, .. } = &resp[resp.len() - 1] {
             if move_str.contains('@') {
                 // Drop format: lowercase piece letter + @ + square
                 assert_eq!(move_str.as_bytes()[0], b'q', "expected lowercase q, got {}", move_str);

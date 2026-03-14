@@ -3,6 +3,7 @@ mod game_state;
 mod strategy;
 mod scoring;
 mod search;
+mod time;
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::fs::File;

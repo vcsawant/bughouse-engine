@@ -21,7 +21,7 @@ const BISHOP_VALUE: i32 = 330;
 const ROOK_VALUE: i32 = 500;
 const QUEEN_VALUE: i32 = 900;
 
-fn piece_value(piece: Piece) -> i32 {
+pub fn piece_value(piece: Piece) -> i32 {
     match piece {
         Piece::Pawn => PAWN_VALUE,
         Piece::Knight => KNIGHT_VALUE,

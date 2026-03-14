@@ -2,14 +2,14 @@
 
 ## What this is
 
-A Rust bughouse chess engine that communicates over stdin/stdout using the UBI protocol and understands BFEN notation. Currently at Phase C (1-ply search with static evaluation). See `README.md` for full architecture and roadmap.
+A Rust bughouse chess engine that communicates over stdin/stdout using the UBI protocol and understands BFEN notation. Currently at Phase D (alpha-beta search with iterative deepening, P/C computation). See `README.md` for full architecture and roadmap.
 
 ## Build & test
 
 ```bash
 cargo build              # debug build
 cargo build --release    # optimized build
-cargo test               # run all unit tests (86 currently)
+cargo test               # run all unit tests (104 currently)
 cargo run                # interactive mode — type UBI commands, Ctrl-D to exit
 ```
 
@@ -24,14 +24,15 @@ src/
 ├── game_state.rs    # EngineState, command dispatch, move selection (no I/O)
 ├── strategy.rs      # PlayStyle enum + time-aware style selection
 ├── scoring.rs       # Static evaluation function (material, PSTs, king safety, etc.)
-└── search.rs        # 1-ply search with drop pruning, checkmate scoring
+├── search.rs        # Alpha-beta negamax with iterative deepening, P/C computation
+└── time.rs          # Time budget allocation from clock state
 docs/
 ├── BFEN.md          # Bughouse FEN spec v0.1 (authoritative)
 └── UBI.md           # Universal Bughouse Interface spec v0.1 (authoritative)
 ```
 
 Future files (not yet created):
-- `src/time.rs` — clock management and time-aware strategy (Phase D)
+- Cross-board strategy layer module (Phase E)
 
 ## Architecture principles
 
@@ -71,11 +72,13 @@ Linked via git in `Cargo.toml`. Changes to the `bughouse-chess` library are enco
 ## Adding evaluation / search logic
 
 Follow the roadmap phases in order:
-- **Phase C**: `scoring.rs` — material counting, positional tables, 1-ply search
-- **Phase D**: `search.rs` — minimax with alpha-beta, iterative deepening; `time.rs` — time budget allocation
-- **Phase E**: Bughouse-specific tuning — reserve valuation, partner coordination, time-aware stalling (see "Evaluation strategy" in README)
+- **Phase C** (done): `scoring.rs` — material counting, positional tables, 1-ply search
+- **Phase D**: `search.rs` — multi-ply alpha-beta with iterative deepening, P/C computation as search byproducts; `time.rs` — time budget allocation
+- **Phase E**: Cross-board strategy layer — combines evaluations from both boards, cross-board minimax, aggressiveness threshold, wait-vs-move logic, stall move selection
 
-The time-aware evaluation framework (README § "Evaluation strategy") defines four `TimeState` variants (`Disadvantage`, `PotentialAdvantage`, `MildDisadvantage`, `LocalAdvantage`) that should drive search budget and move selection strategy.
+The evaluation architecture (README § "Evaluation architecture: dual-process model") defines the three-output per-board evaluation model (move evals, P, C) and the strategy layer that combines them. The four `TimeState` variants (`Disadvantage`, `PotentialAdvantage`, `MildDisadvantage`, `LocalAdvantage`) drive search budgets and aggressiveness thresholds.
+
+**Key design rule**: Evaluation (scoring, search, P, C) is per-board and deterministic. Cross-board reasoning belongs in the strategy layer only.
 
 ## Commit conventions
 

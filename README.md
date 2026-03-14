@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (86 unit tests covering protocol, state, evaluation, search)
+# Test (104 unit tests covering protocol, state, evaluation, search, time)
 cargo test
 ```
 
@@ -78,6 +78,9 @@ ubiok
 readyok
 teammsg need p
 info board A depth 1 nodes 20 time 0 score cp 66 pv b1c3
+info board A depth 2 nodes 391 time 4 score cp 0 pv b1c3
+info board A depth 3 nodes 6901 time 68 score cp 66 pv b1c3
+info board A depth 4 nodes 94708 time 825 score cp 0 pv b1c3
 bestmove board A b1c3
 ```
 
@@ -108,13 +111,15 @@ src/
 ├── game_state.rs    # EngineState + command dispatch → responses (no I/O)
 ├── strategy.rs      # PlayStyle enum + time-aware style selection (stub for Phase C)
 ├── scoring.rs       # Static evaluation: material, reserves, PSTs, king safety, mobility, pawns
-└── search.rs        # 1-ply search with drop pruning
+├── search.rs        # Alpha-beta negamax with iterative deepening, drop pruning, P/C computation
+└── time.rs          # Time budget allocation from clock state
 ```
 
 Board representation, move generation, BFEN parsing, and drop logic all live in the [bughouse-chess](https://github.com/vcsawant/bughouse-chess) library. The engine is deliberately thin — it wires protocol parsing to the library's game logic.
 
 Future phases will add:
 - `time.rs` — clock management and time allocation per move
+- `strategy.rs` — cross-board strategy layer (currently a stub with PlayStyle enum)
 
 ---
 
@@ -165,31 +170,145 @@ Replace random selection with a scored evaluation function and 1-ply search. The
   - All moves guaranteed legal by the library (no self-check, pins enforced)
 - `game_state.rs` — wired search into `handle_go()`, reports depth 1 with actual score and node count
 
-### Phase D — Real search
+### Phase D — Deep search + per-board evaluation (complete)
 
-Introduce tree search so the engine looks multiple moves ahead.
+Multi-ply search with alpha-beta pruning and iterative deepening. Each board's evaluation process produces three outputs: move evaluations, piece acquisition probabilities (P), and piece acquisition costs (C). See [Evaluation architecture](#evaluation-architecture-dual-process-model) below for the full design.
+
+**Implemented:**
+- `search.rs` — alpha-beta negamax with iterative deepening (18 unit tests)
+  - Recursive negamax with alpha-beta pruning to arbitrary depth
+  - MVV-LVA move ordering (captures first, then drops by piece value, then quiet moves)
+  - Drop pruning at every node (attack zone, defense zone, center, promotion zone)
+  - Mate-distance scoring: `MATE_SCORE - ply` prefers shorter checkmates
+  - Iterative deepening: depth 1, 2, 3... until time budget expires; depth 1 always completes
+  - Time check every 1024 nodes; incomplete iterations are discarded
+  - Per-depth `info` line streaming for real-time GUI display
+  - P/C capture statistics computed at root level as search byproduct (zero overhead)
+- `time.rs` — time budget allocation (6 unit tests)
+  - Clock-aware: indexes the correct clock from board ID + side to move
+  - Heuristic: `our_time / 30` remaining moves estimate, clamped to [100ms, 25% of time]
+  - Emergency mode: < 1s remaining → 50ms budget
+- `strategy.rs` — real `determine_play_style` based on clock state (5 unit tests)
+  - `Instant` (< 1s), `Blitz` (< 10s), `Extended` (> 30s with 2x advantage), `Standard` (default)
+
+**Deferred to future optimization:**
+- Quiescence search (searching captures at horizon to avoid tactical blind spots)
+- Transposition table (hash-based position caching)
+- Killer moves and history heuristic for move ordering
+- Continuous background evaluation (pondering) with subtree reuse
+
+### Phase E — Cross-board strategy layer
+
+The engine understands it's playing bughouse, not just two independent chess games. The strategy layer combines evaluations from both board processes to make cross-board-aware decisions.
 
 **Deliverables:**
-- `search.rs` — minimax with alpha-beta pruning, iterative deepening
-- `time.rs` — time budget allocation (how long to search per move)
-
-### Phase E — Bughouse-specific tuning
-
-The engine understands it's playing bughouse, not just two independent chess games.
-
-**Deliverables:**
-- Reserve valuation (a held queen is worth less than a held pawn in some situations)
+- Strategy layer that combines board A and board B evaluations at decision time
+- Cross-board minimax: account for captures feeding the other board's reserves
+- Aggressiveness threshold tuning based on time state
+- Wait-vs-move decision logic using P/C values from the partner's board
 - Partner awareness via `teammsg` / `partnermsg`
-- Positional adjustments for bughouse (e.g. king safety is less important when your partner can drop a defender)
-- Live `info` line streaming during search for real-time GUI thinking display (requires iterative deepening from Phase D)
+- Stall move selection (quiet, non-committal moves when waiting is valuable)
 
 ---
 
-## Evaluation strategy: time-aware move selection
+## Evaluation architecture: dual-process model
 
-Bughouse evaluation differs fundamentally from standard chess. Beyond material and position, the engine must reason about **four clocks**, **two boards**, **reserves**, and **partner coordination**. The core insight driving our evaluation design:
+Bughouse evaluation differs fundamentally from standard chess. Beyond material and position, the engine must reason about **four clocks**, **two boards**, **reserves**, and **partner coordination**. Two core insights drive the design:
 
-> **Time dynamics determine strategic constraints _before_ move selection.** Rather than encoding time awareness into the evaluation function, we filter the strategic mode first, then search within those constraints.
+> 1. **Each board can be evaluated independently.** Move evaluations, piece acquisition probability (P), and piece acquisition cost (C) are deterministic functions of a single board's position. Cross-board reasoning happens in the strategy layer, not the evaluation layer.
+> 2. **Time dynamics determine strategic constraints _before_ move selection.** The strategy layer filters the strategic mode first, then selects moves using evaluations from both boards.
+
+### Per-board evaluation process
+
+Each board runs an independent, continuous evaluation process. Given a position, it produces three outputs:
+
+#### 1. Move evaluations
+
+Standard minimax with alpha-beta pruning over all legal moves (regular + drops from actual reserves) to depth D, with iterative deepening. This is a deepened version of the existing 1-ply search in `search.rs`. The evaluation tree alternates moves (our move → their move → our move). The process deepens continuously until interrupted by a new position or a time budget expiration.
+
+When a new position arrives (opponent moves, or a move on the other board updates reserves), the process checks if the new position is a subtree of the previously evaluated tree. If so, it reuses that subtree and continues deepening from there. Otherwise it restarts evaluation from scratch.
+
+#### 2. P(piece_type, color) — acquisition probability
+
+For each piece type X and each color Y, the probability that Y captures a piece of type X on this board in the near future. Computed as the **minimum** across all instances of piece type X (we want the cheapest-to-acquire instance).
+
+Per-instance probability is derived from the search tree:
+
+| Condition | P |
+|---|---|
+| Piece is hanging (attacked, undefended or under-defended) | 1.0 |
+| Piece is won via tactic (search finds net-positive capture sequence) | 0.8 |
+| Piece is available via equal trade | 0.5 |
+| Piece is only capturable via unfavorable trade | 0.2 |
+| Piece is not capturable within search horizon | 0.0 |
+
+These values are tunable. The key property is that P is deterministic given the position and search depth — the search already discovers which lines involve capturing which pieces.
+
+Both colors' P values are computed because the strategy layer needs to know what our teammate can capture **and** what our opponent can capture on a given board.
+
+#### 3. C(piece_type, color) — acquisition cost
+
+For each piece type X and each color Y, the cost to Y of capturing X on this board. Computed as the **minimum** across all instances of piece type X, where per-instance cost is:
+
+```
+C(X, Y) = best_eval - best_eval_in_lines_where_Y_captures_X
+```
+
+Both values are from Y's perspective. If capturing X is already Y's best line, C = 0 (no extra cost). If capturing X requires a suboptimal line, C equals the eval sacrifice.
+
+Like P, C is a deterministic byproduct of the search — we run minimax normally, note which lines capture which pieces, and the cost falls out of the eval differences.
+
+#### Properties
+
+- **Deterministic**: Given a position and search depth, all three outputs are fully determined. No randomness, no time dependency. This means evaluation results are memoizable and hashable (Zobrist keys from the bughouse-chess library include reserve state).
+- **Continuous**: The process runs iterative deepening in the background. Deeper search refines P, C, and move evaluations. The strategy layer reads whatever depth is available when it needs to decide.
+- **Independent**: Board A's process knows nothing about board B. Cross-board reasoning is the strategy layer's job.
+
+### Strategy layer
+
+The strategy layer activates when the engine receives a `go` command for a specific board. It reads the latest evaluation data from **both** board processes and combines them to pick a move.
+
+#### Combining cross-board evaluations
+
+For the board we need to move on (say board A), the strategy layer considers:
+
+**Regular moves and drops from actual reserves:** Ranked directly by board A's minimax evaluation.
+
+**Potential drops (pieces not yet in reserves):** For each piece type X not currently in our reserves on board A:
+
+```
+wait_value(X) = P_teammate(X) on board B
+              × eval_of_best_drop(X) on board A
+              − C_teammate(X) on board B
+```
+
+This tells us the expected value of waiting for a piece to arrive from board B. If `wait_value(X)` exceeds the best available move, the engine may choose to stall (if the time state permits).
+
+**Cross-board feedback (order-1):** When considering a capture on board A that sends piece Y to board B's opponent, the strategy layer checks board B's evaluation to estimate the damage. Specifically, it looks at how Y in the opponent's reserves affects board B's eval. This prevents the engine from, e.g., capturing a knight on board A (good locally) when that knight would devastate our teammate on board B.
+
+Higher-order feedback (the piece gets dropped, changes the position, changes P/C for other pieces) grows exponentially. The strategy layer bounds this at order-1 for now, with room to deepen when time permits and the decision is close.
+
+#### Aggressiveness threshold
+
+A scalar derived from the time state that modulates the team's willingness to accept cost. Governs how much C the strategy is willing to tolerate for a given P and wait_value:
+
+- **Time advantage** → accept higher C (teammate can afford to sacrifice material to feed us pieces)
+- **Time disadvantage** → only accept C ≈ 0 (take what's free, don't speculate)
+- **Teammate crushing on board B** → accept very high C (teammate can afford to lose material)
+
+Example: Board B teammate can capture a knight at C = 200cp. That knight would be worth +350cp dropped on board A. If the team has a time advantage, the strategy accepts the 200cp cost because the net team value is +150cp. In time trouble, it wouldn't — too speculative.
+
+#### Decision flow
+
+1. Read latest evaluations from both board processes
+2. Compute `wait_value(X)` for each missing piece type
+3. Compare `best_move_now` (board A's top minimax result) vs `best_wait_value`
+4. Apply aggressiveness threshold based on time state
+5. If waiting is better and time state allows stalling → play a quiet stall move
+6. Otherwise → play `best_move_now`
+7. Short-circuit: if `best_move_now` is checkmate or exceeds all alternatives by a large threshold, play it immediately regardless of wait values
+
+The strategy allocates a time budget based on PlayStyle. It makes a preliminary decision immediately with whatever depth is available, then refines as deeper evaluation results arrive, until the time budget expires.
 
 ### Time state detection
 
@@ -211,31 +330,22 @@ These combine into four strategic time states:
 | `MildDisadvantage` | Opponent team has more total active time | Play solid, standard search depth |
 | `LocalAdvantage` | Player has significantly more time than direct opponent (even if opponent's clock is paused) | Deep search, play forcing moves to exploit opponent's time trouble |
 
-### Strategic decision tree
-
-Move selection follows a three-level decision tree:
-
-**Level 1 — Can we stall?**
-Stalling is only viable in `PotentialAdvantage` or `LocalAdvantage` states. When both team clocks are running, stalling is self-destructive.
-
-**Level 2 — Should we stall?**
-Even when stalling is possible, it must have strategic value:
-- Waiting for a critical piece from the partner (e.g., partner is about to capture a queen)
-- Partner is in a losing position and needs thinking time
-- Direct opponent is in severe time trouble (< 5s) — stalling applies pressure
-- No good moves are available — waiting for the position to improve
-
-Counter-stalling detection: if the opponent can also stall, avoid mutual deadlock and play normally.
-
-**Level 3 — Move selection within strategy**
+### PlayStyle and move selection
 
 | Time state | Search budget | Move preference |
 |---|---|---|
-| `Disadvantage` | ~500ms, shallow | Aggressive, forcing moves |
-| `MildDisadvantage` | ~1500ms, standard | Solid positional play |
-| `PotentialAdvantage` / `LocalAdvantage` | ~3000ms, deep | Best move with full search |
-| Stalling | Minimal | Quiet, non-committal moves that maintain flexibility and king safety |
-| Ultra-low time (< 1s) | Instant | Pre-calculated safe move |
+| `Disadvantage` / `Blitz` | ~500ms, shallow | Aggressive, forcing moves. Low aggressiveness threshold — only accept free pieces. |
+| `MildDisadvantage` / `Standard` | ~1500ms, standard | Solid positional play. Moderate aggressiveness. |
+| `PotentialAdvantage` / `LocalAdvantage` / `Extended` | ~3000ms, deep | Best move with full search. High aggressiveness — willing to accept cost for speculative pieces. |
+| Stalling / `Slow` | Minimal | Quiet, non-committal moves that maintain flexibility and king safety. |
+| Ultra-low time / `Instant` | Instant | Pre-calculated safe move. |
+
+**Blitz (MoveFast)** is the simplest strategy and the first to implement. It strongly prefers positional play on the current board:
+- Uses board A's minimax eval as the primary signal
+- Low aggressiveness threshold (don't accept high cost for speculative pieces)
+- Rarely waits for pieces (`wait_value` must massively exceed `best_move_now`)
+- Short time budget — takes whatever search depth is available quickly
+- Essentially plays "good chess" with minimal bughouse-specific speculation
 
 ### Stall move selection
 
@@ -251,15 +361,21 @@ When the engine decides to stall, it picks the quietest safe move available:
 - **Opponent counter-stalling**: If both sides can stall, default to normal play to avoid deadlock.
 - **Ultra-low time (< 1s)**: Bypass all strategy and play a pre-calculated safe move instantly.
 
+### Known limitations and future work
+
+**Alternating-move assumption:** The evaluation process models each board as alternating moves (our turn → their turn). In reality, moves across the two boards are asynchronous — a player on board B might make three moves while board A makes one. This is a simplification we accept for now; future work could model probabilistic move interleaving.
+
+**Order-1 feedback bound:** The strategy layer only considers first-order cross-board effects (capture on A → piece enters B's reserves → evaluate impact on B). Deeper feedback chains (that piece gets dropped on B, changes B's position, changes P/C for other pieces on B, which affects what board A should do) are not modeled. This bound exists because the branching factor explodes exponentially. The strategy layer can optionally explore order-2+ when time permits and the decision is close.
+
+**P/C locality:** P and C are estimated from a single board's position without knowledge of the other board. This means the cost estimate can be wrong — e.g., C(knight) on board B looks cheap, but the traded bishop would be devastating to us on board A. The strategy layer's cross-board feedback check catches the most egregious cases (order-1), but subtle multi-step interactions are missed.
+
 ### Implementation phases
 
-This framework maps onto the existing roadmap:
-
-| Phase | Time-related deliverable |
+| Phase | Deliverable |
 |---|---|
-| **Phase C** | `PlayStyle` enum, `determine_play_style()` stub, basic search budget allocation |
-| **Phase D** | `time.rs` — full time management, stall detection, search depth adjustment |
-| **Phase E** | Partner-aware stalling (waiting for pieces), opponent time pressure tactics |
+| **Phase C** (done) | `PlayStyle` enum, `determine_play_style()` stub, 1-ply search, static evaluation |
+| **Phase D** | Multi-ply alpha-beta search, iterative deepening, P/C computation as search byproducts, `time.rs` for time budgets, continuous background evaluation |
+| **Phase E** | Strategy layer combining both boards, cross-board minimax, aggressiveness threshold, wait-vs-move logic, stall move selection, `teammsg`/`partnermsg` coordination |
 
 ---
 
@@ -292,4 +408,4 @@ bughouse-chess = { git = "https://github.com/vcsawant/bughouse-chess", branch = 
 | Target | `aarch64-apple-darwin` (Apple Silicon) |
 | Bitboard width | 64-bit (`u64`) — one per piece-type × colour |
 | Protocol | Line-based stdin/stdout (no network sockets) |
-| Concurrency | Single-threaded for now; search parallelism is a Phase D+ consideration |
+| Concurrency | Single-threaded for now; dual-board evaluation processes and search parallelism are Phase D+ considerations |
