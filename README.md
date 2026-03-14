@@ -115,7 +115,7 @@ src/
 └── time.rs          # Time budget allocation from clock state
 ```
 
-Board representation, move generation, BFEN parsing, and drop logic all live in the [bughouse-chess](https://github.com/vcsawant/bughouse-chess) library. The engine is deliberately thin — it wires protocol parsing to the library's game logic.
+Board representation, move generation, BFEN parsing, and drop logic all live in the [bughouse-chess](https://github.com/vcsawant/bughouse-chess) library. The library also provides precomputed bitboard lookup tables (king zone, forward file masks, attack maps) that the engine uses for O(1) evaluation queries. The engine is deliberately thin — it handles search policy and protocol, while the library handles chess primitives.
 
 Future phases will add:
 - `time.rs` — clock management and time allocation per move

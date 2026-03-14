@@ -6,8 +6,8 @@
 
 use bughouse_chess::{
     BitBoard, Board, BoardStatus, BughouseMove, Color, File,
-    MoveGen, Piece, Rank, EMPTY,
-    get_file, get_king_moves, get_rank,
+    MoveGen, Piece, Rank, EMPTY, NUM_NON_KING_PIECES,
+    get_file, get_king_moves, get_king_zone, get_rank,
 };
 
 use std::time::Instant;
@@ -24,9 +24,6 @@ const MATE_SCORE: i32 = 30000;
 /// How often to check the clock (every N nodes).
 const TIME_CHECK_INTERVAL: usize = 1024;
 
-/// Number of non-king piece types (Pawn, Knight, Bishop, Rook, Queen).
-const NUM_PIECE_TYPES: usize = 5;
-
 /// Per-piece-type capture statistics derived from the search tree.
 ///
 /// P(piece_type, color) = probability that `color` captures a piece of type `piece_type`.
@@ -36,28 +33,16 @@ const NUM_PIECE_TYPES: usize = 5;
 /// 0=Pawn, 1=Knight, 2=Bishop, 3=Rook, 4=Queen.
 #[derive(Debug, Clone)]
 pub struct CaptureStats {
-    pub probability: [[f32; NUM_PIECE_TYPES]; 2],
-    pub cost: [[i32; NUM_PIECE_TYPES]; 2],
+    pub probability: [[f32; NUM_NON_KING_PIECES]; 2],
+    pub cost: [[i32; NUM_NON_KING_PIECES]; 2],
 }
 
 impl Default for CaptureStats {
     fn default() -> Self {
         CaptureStats {
-            probability: [[0.0; NUM_PIECE_TYPES]; 2],
-            cost: [[0; NUM_PIECE_TYPES]; 2],
+            probability: [[0.0; NUM_NON_KING_PIECES]; 2],
+            cost: [[0; NUM_NON_KING_PIECES]; 2],
         }
-    }
-}
-
-/// Map a Piece to the CaptureStats index (0-4). King returns None.
-fn piece_to_index(piece: Piece) -> Option<usize> {
-    match piece {
-        Piece::Pawn => Some(0),
-        Piece::Knight => Some(1),
-        Piece::Bishop => Some(2),
-        Piece::Rook => Some(3),
-        Piece::Queen => Some(4),
-        Piece::King => None,
     }
 }
 
@@ -320,11 +305,11 @@ fn compute_capture_stats(best_eval: i32, root_evals: &[RootMoveEval], side: Colo
     let ci = side.to_index();
 
     // Group captures by piece type: track the best eval for each captured piece type
-    let mut best_capture_eval: [Option<i32>; NUM_PIECE_TYPES] = [None; NUM_PIECE_TYPES];
+    let mut best_capture_eval: [Option<i32>; NUM_NON_KING_PIECES] = [None; NUM_NON_KING_PIECES];
 
     for eval in root_evals {
         if let Some(captured) = eval.captured {
-            if let Some(idx) = piece_to_index(captured) {
+            if let Some(idx) = captured.non_king_index() {
                 let current_best = best_capture_eval[idx].unwrap_or(i32::MIN);
                 if eval.score > current_best {
                     best_capture_eval[idx] = Some(eval.score);
@@ -334,10 +319,10 @@ fn compute_capture_stats(best_eval: i32, root_evals: &[RootMoveEval], side: Colo
     }
 
     // Compute P and C for each piece type
-    for idx in 0..NUM_PIECE_TYPES {
+    for idx in 0..NUM_NON_KING_PIECES {
         if let Some(capture_eval) = best_capture_eval[idx] {
             // C = best_eval - best_capture_eval (cost of going for this capture instead of best move)
-            let cost = best_eval - capture_eval;
+            let cost: i32 = best_eval - capture_eval;
             stats.cost[ci][idx] = cost.max(0); // Cost is never negative
 
             // P based on how close the capture eval is to the best eval
@@ -477,13 +462,8 @@ fn build_drop_mask(board: &Board) -> BitBoard {
     let our_king_sq = board.king_square(us);
     let enemy_king_sq = board.king_square(them);
 
-    // Attack zone: 2 rings around enemy king
-    let ring1 = get_king_moves(enemy_king_sq);
-    let mut ring2 = EMPTY;
-    for sq in ring1 {
-        ring2 |= get_king_moves(sq);
-    }
-    let attack_zone = ring1 | ring2;
+    // Attack zone: 2 rings around enemy king (precomputed table)
+    let attack_zone = get_king_zone(enemy_king_sq);
 
     // Defense zone: 1 ring around our king
     let defense_zone = get_king_moves(our_king_sq);
@@ -837,7 +817,7 @@ mod tests {
         let result = search(&board, 2).unwrap();
         let stats = &result.capture_stats;
         // White (index 0) should have high P for bishop (index 2) since it's hanging
-        let bishop_idx = piece_to_index(Piece::Bishop).unwrap();
+        let bishop_idx = Piece::Bishop.non_king_index().unwrap();
         assert!(stats.probability[0][bishop_idx] > 0.5,
             "hanging bishop should have high P, got {}",
             stats.probability[0][bishop_idx]
@@ -856,7 +836,7 @@ mod tests {
         let result = search(&board, 1).unwrap();
         let stats = &result.capture_stats;
         // All P values should be 0.0 since no captures are possible
-        for idx in 0..NUM_PIECE_TYPES {
+        for idx in 0..NUM_NON_KING_PIECES {
             assert_eq!(stats.probability[0][idx], 0.0,
                 "no captures in startpos: P[{}] should be 0.0, got {}",
                 idx, stats.probability[0][idx]
@@ -908,7 +888,7 @@ mod tests {
         let result = search(&board, 2).unwrap();
         let stats = &result.capture_stats;
         // Queen (index 4) should be capturable with high P
-        let queen_idx = piece_to_index(Piece::Queen).unwrap();
+        let queen_idx = Piece::Queen.non_king_index().unwrap();
         assert!(stats.probability[0][queen_idx] > 0.0,
             "should detect queen capture possibility, P={}",
             stats.probability[0][queen_idx]

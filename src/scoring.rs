@@ -7,9 +7,9 @@
 //! mobility, and pawn structure.
 
 use bughouse_chess::{
-    BitBoard, Board, BoardStatus, Color, File, Piece, Rank, Square,
+    Board, BoardStatus, Color, File, Piece, Rank,
     ALL_FILES, ALL_PIECES, EMPTY,
-    get_adjacent_files, get_bishop_moves, get_file, get_king_moves,
+    get_adjacent_files, get_bishop_moves, get_file, get_king_zone,
     get_knight_moves, get_rank, get_rook_moves,
 };
 
@@ -246,12 +246,11 @@ fn king_safety(board: &Board, color: Color) -> i32 {
         }
     }
 
-    // (c) Attackers on king zone
-    let king_zone = get_king_moves(king_sq);
-    for sq in king_zone {
-        let attackers = board.attackers_to(sq) & *board.color_combined(opponent);
-        penalty -= 10 * attackers.popcnt() as i32;
-    }
+    // (c) Attackers on king zone (2-ring)
+    let king_zone = get_king_zone(king_sq);
+    let opp_attacks = board.attacks_by(opponent);
+    let zone_under_attack = (king_zone & opp_attacks).popcnt() as i32;
+    penalty -= 10 * zone_under_attack;
 
     // (d) Reserve amplifier: scale penalty by opponent's reserve value
     let opp_reserve_val = reserve_material_value(board, opponent);
@@ -303,7 +302,6 @@ fn mobility_score(board: &Board, color: Color) -> i32 {
 /// Pawn structure score for one color.
 fn pawn_structure(board: &Board, color: Color) -> i32 {
     let our_pawns = *board.pieces(Piece::Pawn) & *board.color_combined(color);
-    let opp_pawns = *board.pieces(Piece::Pawn) & *board.color_combined(!color);
     let mut score = 0i32;
 
     for file in ALL_FILES {
@@ -327,7 +325,7 @@ fn pawn_structure(board: &Board, color: Color) -> i32 {
 
     // Passed pawns: bonus by advancement
     for sq in our_pawns {
-        if is_passed_pawn(sq, color, opp_pawns) {
+        if board.is_passed_pawn(sq, color) {
             let rank_from_promo = match color {
                 Color::White => sq.get_rank().to_index(),
                 Color::Black => 7 - sq.get_rank().to_index(),
@@ -343,30 +341,6 @@ fn pawn_structure(board: &Board, color: Color) -> i32 {
     }
 
     score
-}
-
-/// Check if a pawn is passed (no enemy pawns on same or adjacent files ahead).
-fn is_passed_pawn(sq: Square, color: Color, opp_pawns: BitBoard) -> bool {
-    let file = sq.get_file();
-    let file_mask = get_file(file) | get_adjacent_files(file);
-
-    // Build a mask of ranks ahead of this pawn
-    let rank = sq.get_rank().to_index();
-    let mut ahead_mask = EMPTY;
-    match color {
-        Color::White => {
-            for r in (rank + 1)..8 {
-                ahead_mask |= get_rank(Rank::from_index(r));
-            }
-        }
-        Color::Black => {
-            for r in 0..rank {
-                ahead_mask |= get_rank(Rank::from_index(r));
-            }
-        }
-    }
-
-    (opp_pawns & file_mask & ahead_mask) == EMPTY
 }
 
 // ─── Main Evaluation ────────────────────────────────────────────────
@@ -454,6 +428,7 @@ pub fn evaluate(board: &Board) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bughouse_chess::Square;
 
     #[test]
     fn starting_position_near_zero() {
@@ -741,9 +716,8 @@ mod tests {
                 .parse()
                 .unwrap();
         let e5 = Square::make_square(Rank::Fifth, File::E);
-        let opp_pawns = *board.pieces(Piece::Pawn) & *board.color_combined(Color::Black);
         assert!(
-            is_passed_pawn(e5, Color::White, opp_pawns),
+            board.is_passed_pawn(e5, Color::White),
             "e5 pawn should be passed (no black pawns on d/e/f ahead)"
         );
     }
@@ -756,9 +730,8 @@ mod tests {
                 .parse()
                 .unwrap();
         let e4 = Square::make_square(Rank::Fourth, File::E);
-        let opp_pawns = *board.pieces(Piece::Pawn) & *board.color_combined(Color::Black);
         assert!(
-            !is_passed_pawn(e4, Color::White, opp_pawns),
+            !board.is_passed_pawn(e4, Color::White),
             "e4 pawn should not be passed (black pawn on e5)"
         );
     }
@@ -771,9 +744,8 @@ mod tests {
                 .parse()
                 .unwrap();
         let e5 = Square::make_square(Rank::Fifth, File::E);
-        let opp_pawns = *board.pieces(Piece::Pawn) & *board.color_combined(Color::Black);
         assert!(
-            !is_passed_pawn(e5, Color::White, opp_pawns),
+            !board.is_passed_pawn(e5, Color::White),
             "e5 pawn should not be passed (black pawn on d6 blocks)"
         );
     }
