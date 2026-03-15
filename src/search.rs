@@ -5,7 +5,7 @@
 //! (king attack/defense zones, center, promotion zone) at every node.
 
 use bughouse_chess::{
-    BitBoard, Board, BoardStatus, BughouseMove, Color, File,
+    BitBoard, Board, BoardStatus, BughouseMove, CacheTable, Color, File,
     MoveGen, Piece, Rank, EMPTY, NUM_NON_KING_PIECES,
     get_file, get_king_moves, get_king_zone, get_rank,
 };
@@ -14,6 +14,54 @@ use std::time::Instant;
 use log::debug;
 
 use crate::scoring;
+
+// ─── Transposition Table ────────────────────────────────────────────
+
+/// TT entry flag: score is the exact minimax value.
+const TT_FLAG_EXACT: u8 = 0;
+/// TT entry flag: score is a lower bound (beta cutoff occurred).
+const TT_FLAG_LOWER: u8 = 1;
+/// TT entry flag: score is an upper bound (no move beat alpha).
+const TT_FLAG_UPPER: u8 = 2;
+
+/// Transposition table entry. 8 bytes, stored in CacheTable.
+#[derive(Copy, Clone, PartialEq, PartialOrd)]
+pub struct TTEntry {
+    pub score: i16,
+    pub best_move: u16,
+    pub depth: u8,
+    pub flag: u8,
+}
+
+/// Default empty TT entry.
+pub const TT_DEFAULT: TTEntry = TTEntry { score: 0, best_move: 0, depth: 0, flag: 0 };
+
+/// Default TT size: 2^20 entries = ~8 MB.
+pub const TT_DEFAULT_SIZE: usize = 1 << 20;
+
+/// Adjust a score for TT storage: convert ply-relative mate scores to node-relative.
+fn score_to_tt(score: i32, ply: u32) -> i16 {
+    let adjusted = if score > MATE_SCORE - 100 {
+        score + ply as i32  // storing a positive mate: add ply to make it node-relative
+    } else if score < -(MATE_SCORE - 100) {
+        score - ply as i32  // storing a negative mate: subtract ply
+    } else {
+        score
+    };
+    adjusted.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Adjust a score from TT retrieval: convert node-relative mate scores to ply-relative.
+fn score_from_tt(score: i16, ply: u32) -> i32 {
+    let s = score as i32;
+    if s > MATE_SCORE - 100 {
+        s - ply as i32
+    } else if s < -(MATE_SCORE - 100) {
+        s + ply as i32
+    } else {
+        s
+    }
+}
 
 /// Maximum search depth (hard cap for iterative deepening).
 const MAX_DEPTH: u32 = 64;
@@ -68,12 +116,13 @@ pub struct SearchInfo {
     pub pv: Vec<String>,
 }
 
-/// Shared search state for time management.
-struct SearchContext {
+/// Shared search state for time management and transposition table.
+struct SearchContext<'a> {
     start: Instant,
     budget_ms: u64,
     nodes: usize,
     time_up: bool,
+    tt: &'a mut CacheTable<TTEntry>,
 }
 
 // ─── Move Generation ─────────────────────────────────────────────────
@@ -172,7 +221,75 @@ fn make_move(board: &Board, m: &BughouseMove) -> Option<Board> {
     }
 }
 
-/// Recursive negamax with alpha-beta pruning.
+/// Quiescence search: continue searching captures at the horizon until
+/// the position is quiet. Prevents the horizon effect where the engine
+/// stops looking right before a recapture or tactical sequence.
+fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
+    // Time check
+    if ctx.nodes % TIME_CHECK_INTERVAL == 0 && ctx.budget_ms > 0 {
+        if ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+            ctx.time_up = true;
+            return 0;
+        }
+    }
+
+    // Terminal detection
+    match board.status() {
+        BoardStatus::Checkmate => return -(MATE_SCORE - ply as i32),
+        BoardStatus::Stalemate => return 0,
+        BoardStatus::Ongoing => {}
+    }
+
+    ctx.nodes += 1;
+    let stand_pat = scoring::evaluate(board);
+
+    // Beta cutoff: position is already good enough without capturing
+    if stand_pat >= beta {
+        return beta;
+    }
+    if stand_pat > alpha {
+        alpha = stand_pat;
+    }
+
+    // Generate and order capture moves only
+    let mut captures: Vec<BughouseMove> = MoveGen::capture_moves(board)
+        .map(BughouseMove::Regular)
+        .collect();
+
+    if captures.is_empty() {
+        return alpha; // Position is quiet
+    }
+
+    order_moves(board, &mut captures);
+
+    for m in &captures {
+        if ctx.time_up {
+            break;
+        }
+
+        let child = match make_move(board, m) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let score = -quiescence(&child, ply + 1, -beta, -alpha, ctx);
+
+        if ctx.time_up {
+            break;
+        }
+
+        if score > alpha {
+            alpha = score;
+        }
+        if alpha >= beta {
+            break; // Beta cutoff
+        }
+    }
+
+    alpha
+}
+
+/// Recursive negamax with alpha-beta pruning and transposition table.
 ///
 /// Returns the score from the perspective of `board.side_to_move()`.
 /// `depth` is remaining depth to search. `ply` is distance from root (for mate scoring).
@@ -192,10 +309,34 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
         BoardStatus::Ongoing => {}
     }
 
-    // Leaf node: static evaluation
+    // Leaf node: quiescence search (captures only until position is quiet)
     if depth == 0 {
-        ctx.nodes += 1;
-        return scoring::evaluate(board);
+        return quiescence(board, ply, alpha, beta, ctx);
+    }
+
+    let original_alpha = alpha;
+    let hash = board.get_hash();
+    let mut tt_best_move: u16 = 0;
+
+    // TT probe
+    if let Some(entry) = ctx.tt.get(hash) {
+        tt_best_move = entry.best_move;
+        if entry.depth as u32 >= depth {
+            let tt_score = score_from_tt(entry.score, ply);
+            match entry.flag {
+                TT_FLAG_EXACT => return tt_score,
+                TT_FLAG_LOWER => {
+                    if tt_score > alpha { alpha = tt_score; }
+                }
+                TT_FLAG_UPPER => {
+                    if tt_score < beta { /* beta = tt_score; -- conservative: don't narrow beta from TT upper bound */ }
+                }
+                _ => {}
+            }
+            if alpha >= beta {
+                return tt_score;
+            }
+        }
     }
 
     let mut moves = generate_moves(board);
@@ -208,7 +349,17 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
 
     order_moves(board, &mut moves);
 
+    // TT best move ordering: if we have a TT hit with a best move, put it first
+    if tt_best_move != 0 {
+        if let Some(tt_move) = BughouseMove::decompress(tt_best_move) {
+            if let Some(pos) = moves.iter().position(|m| *m == tt_move) {
+                moves.swap(0, pos);
+            }
+        }
+    }
+
     let mut best_score = i32::MIN + 1; // Avoid overflow on negation
+    let mut best_move: u16 = 0;
 
     for m in &moves {
         if ctx.time_up {
@@ -228,6 +379,7 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
 
         if score > best_score {
             best_score = score;
+            best_move = m.compress();
         }
         if score > alpha {
             alpha = score;
@@ -235,6 +387,23 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
         if alpha >= beta {
             break; // Beta cutoff
         }
+    }
+
+    // TT store (skip if time ran out mid-search — result is incomplete)
+    if !ctx.time_up {
+        let flag = if best_score <= original_alpha {
+            TT_FLAG_UPPER
+        } else if best_score >= beta {
+            TT_FLAG_LOWER
+        } else {
+            TT_FLAG_EXACT
+        };
+        ctx.tt.add(hash, TTEntry {
+            score: score_to_tt(best_score, ply),
+            best_move,
+            depth: depth as u8,
+            flag,
+        });
     }
 
     best_score
@@ -250,7 +419,7 @@ struct RootMoveEval {
 
 /// Search at a single fixed depth (used internally by iterative deepening and tests).
 /// Returns the best move, score, PV, and all root move evaluations (for P/C computation).
-fn search_at_depth(board: &Board, moves: &[BughouseMove], depth: u32, ctx: &mut SearchContext) -> Option<(BughouseMove, i32, Vec<String>, Vec<RootMoveEval>)> {
+fn search_at_depth(board: &Board, moves: &[BughouseMove], depth: u32, ctx: &mut SearchContext<'_>) -> Option<(BughouseMove, i32, Vec<String>, Vec<RootMoveEval>)> {
     let mut best_move: Option<BughouseMove> = None;
     let mut best_score = i32::MIN + 1;
     let mut best_pv = Vec::new();
@@ -348,7 +517,7 @@ fn compute_capture_stats(best_eval: i32, root_evals: &[RootMoveEval], side: Colo
 /// Searches depth 1, 2, 3, ... until `budget_ms` expires. Depth 1 always
 /// completes regardless of budget. Each completed depth pushes a `SearchInfo`
 /// into `info_sink`. Returns `None` if there are no legal moves.
-pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<SearchInfo>) -> Option<SearchResult> {
+pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<SearchInfo>, tt: &mut CacheTable<TTEntry>) -> Option<SearchResult> {
     let mut moves = generate_moves(board);
     if moves.is_empty() {
         return None;
@@ -361,6 +530,7 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
         budget_ms,
         nodes: 0,
         time_up: false,
+        tt,
     };
 
     let mut best_result: Option<SearchResult> = None;
@@ -425,11 +595,13 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
     }
     order_moves(board, &mut moves);
 
+    let mut local_tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
     let mut ctx = SearchContext {
         start: Instant::now(),
         budget_ms: 0, // No time limit
         nodes: 0,
         time_up: false,
+        tt: &mut local_tt,
     };
 
     let result = search_at_depth(board, &moves, search_depth, &mut ctx);
@@ -687,11 +859,13 @@ mod tests {
     #[test]
     fn negamax_depth_0_returns_static_eval() {
         let board = Board::default();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
         let mut ctx = SearchContext {
             start: Instant::now(),
             budget_ms: 0,
             nodes: 0,
             time_up: false,
+            tt: &mut tt,
         };
         let score = negamax(&board, 0, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -765,8 +939,9 @@ mod tests {
     fn iterative_deepening_with_budget() {
         let board = Board::default();
         let mut info_sink = Vec::new();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
         // Give generous budget — should reach depth > 1
-        let result = find_best_move_timed(&board, 5000, &mut info_sink).unwrap();
+        let result = find_best_move_timed(&board, 5000, &mut info_sink, &mut tt).unwrap();
         assert!(result.depth >= 2, "should reach at least depth 2, got {}", result.depth);
         assert!(info_sink.len() >= 2, "should have at least 2 info entries, got {}", info_sink.len());
         // Info entries should have increasing depth
@@ -779,8 +954,9 @@ mod tests {
     fn iterative_deepening_zero_budget_completes_depth_1() {
         let board = Board::default();
         let mut info_sink = Vec::new();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
         // Zero budget — depth 1 should still complete
-        let result = find_best_move_timed(&board, 0, &mut info_sink).unwrap();
+        let result = find_best_move_timed(&board, 0, &mut info_sink, &mut tt).unwrap();
         assert_eq!(result.depth, 1, "depth 1 should complete even with 0 budget");
         assert!(!info_sink.is_empty(), "should have at least 1 info entry");
     }
@@ -853,7 +1029,8 @@ mod tests {
                 .parse()
                 .unwrap();
         let mut info_sink = Vec::new();
-        let result = find_best_move_timed(&board, 2000, &mut info_sink);
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let result = find_best_move_timed(&board, 2000, &mut info_sink, &mut tt);
         assert!(result.is_some(), "should find a move without crashing");
         assert!(result.unwrap().depth >= 1, "should complete at least depth 1");
     }
@@ -892,6 +1069,135 @@ mod tests {
         assert!(stats.probability[0][queen_idx] > 0.0,
             "should detect queen capture possibility, P={}",
             stats.probability[0][queen_idx]
+        );
+    }
+
+    #[test]
+    fn tt_warm_reduces_nodes() {
+        // Search the same position twice with a shared TT.
+        // The second search should evaluate fewer nodes because
+        // the TT is warm from the first search.
+        let board = Board::default();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+
+        let mut info1 = Vec::new();
+        let r1 = find_best_move_timed(&board, 5000, &mut info1, &mut tt).unwrap();
+
+        let mut info2 = Vec::new();
+        let r2 = find_best_move_timed(&board, 5000, &mut info2, &mut tt).unwrap();
+
+        // Same depth, same best move
+        assert_eq!(r1.depth, r2.depth, "should reach same depth");
+        assert_eq!(format!("{}", r1.best_move), format!("{}", r2.best_move),
+            "should find same best move");
+        // Second search should use fewer nodes (TT hits skip subtrees)
+        assert!(r2.nodes <= r1.nodes,
+            "warm TT should reduce nodes: first={}, second={}",
+            r1.nodes, r2.nodes
+        );
+    }
+
+    #[test]
+    fn tt_preserves_correctness() {
+        // Hanging queen should still be captured with TT enabled
+        let board: Board =
+            "rnb1kbnr/pppppppp/8/4q3/8/5N2/PPPPPPPP/RNBQKB1R[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        let result = search(&board, 2).unwrap();
+        assert!(result.score > 500,
+            "should capture hanging queen with TT, score={}", result.score);
+    }
+
+    #[test]
+    fn tt_mate_score_correct() {
+        // Mate in 1 should still score correctly with TT
+        let board: Board =
+            "7k/7p/5BQ1/8/8/8/8/7K[] w - - 0 1"
+                .parse()
+                .unwrap();
+        let result = search(&board, 1).unwrap();
+        assert_eq!(result.score, MATE_SCORE - 1,
+            "mate-in-1 with TT should score {}, got {}",
+            MATE_SCORE - 1, result.score
+        );
+    }
+
+    #[test]
+    fn quiescence_quiet_position() {
+        // Starting position has no captures — quiescence should return
+        // roughly the static eval with minimal node count.
+        let board = Board::default();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let mut ctx = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+        };
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
+        let static_eval = scoring::evaluate(&board);
+        assert_eq!(score, static_eval,
+            "quiescence in quiet position should match static eval: got {}, expected {}",
+            score, static_eval
+        );
+        assert_eq!(ctx.nodes, 1, "quiet position should evaluate 1 node (stand_pat only)");
+    }
+
+    #[test]
+    fn quiescence_finds_recapture() {
+        // White knight on c3 just captured a pawn on d5. Black queen on d8
+        // can recapture Qxd5. At depth 1 without quiescence, white might
+        // think Nxd5 is free. With quiescence, the recapture is found.
+        //
+        // Position: white Nc3 captured to d5, black Qd8 can recapture.
+        let board: Board =
+            "rnbqkb1r/pppppppp/5n2/3N4/8/8/PPPPPPPP/R1BQKBNR[] b KQkq - 0 1"
+                .parse()
+                .unwrap();
+        // From black's perspective, Qxd5 captures the knight.
+        // Quiescence should find this capture and evaluate favorably for black.
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let mut ctx = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+        };
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
+        // Black can capture a knight (+320cp) so quiescence should score
+        // significantly better than just stand_pat
+        let static_eval = scoring::evaluate(&board);
+        assert!(score >= static_eval,
+            "quiescence should find capture opportunity: score={}, static_eval={}",
+            score, static_eval
+        );
+        assert!(ctx.nodes > 1, "should explore capture nodes, got {} nodes", ctx.nodes);
+    }
+
+    #[test]
+    fn quiescence_doesnt_worsen_eval() {
+        // Quiescence should never return worse than static eval because
+        // stand_pat gives the option to not capture.
+        let board: Board =
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR[] b KQkq - 0 1"
+                .parse()
+                .unwrap();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let mut ctx = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+        };
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
+        let static_eval = scoring::evaluate(&board);
+        assert!(score >= static_eval,
+            "quiescence should never be worse than stand_pat: score={}, static_eval={}",
+            score, static_eval
         );
     }
 }

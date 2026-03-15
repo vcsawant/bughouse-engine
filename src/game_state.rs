@@ -4,11 +4,11 @@
 //! `process_command()` which maps parsed UBI commands to responses.
 //! No I/O — all output is returned as `Vec<UbiResponse>`.
 
-use bughouse_chess::Board;
+use bughouse_chess::{Board, CacheTable};
 use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 
-use crate::search;
+use crate::search::{self, TTEntry, TT_DEFAULT, TT_DEFAULT_SIZE};
 use crate::strategy;
 use crate::ubi::{BoardId, UbiCommand, UbiResponse, PositionSpec, format_move};
 
@@ -19,6 +19,8 @@ pub struct EngineState {
     clocks: [u64; 4],  // white_A=0, black_A=1, white_B=2, black_B=3
     rng: rand::rngs::ThreadRng,
     pub game_id: String,
+    tt: CacheTable<TTEntry>,
+    tt_size: usize,
 }
 
 impl EngineState {
@@ -28,6 +30,8 @@ impl EngineState {
             clocks: [0; 4],
             rng: rand::thread_rng(),
             game_id,
+            tt: CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT),
+            tt_size: TT_DEFAULT_SIZE,
         }
     }
 
@@ -35,6 +39,7 @@ impl EngineState {
     pub fn reset(&mut self) {
         self.boards = [None, None];
         self.clocks = [0; 4];
+        self.tt = CacheTable::new(self.tt_size, TT_DEFAULT);
     }
 
     /// Get a reference to the board for the given board id.
@@ -66,7 +71,21 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
             vec![]
         }
 
-        UbiCommand::SetOption { .. } => vec![],
+        UbiCommand::SetOption { name, value } => {
+            if name.eq_ignore_ascii_case("Hash") {
+                if let Some(val) = value {
+                    if let Ok(mb) = val.trim().parse::<usize>() {
+                        // Convert MB to entry count (power of 2)
+                        let bytes = mb.max(1) * 1024 * 1024;
+                        let entries = (bytes / std::mem::size_of::<TTEntry>()).next_power_of_two();
+                        info!("[game:{}] Hash table resized to {} MB ({} entries)", state.game_id, mb, entries);
+                        state.tt_size = entries;
+                        state.tt = CacheTable::new(entries, TT_DEFAULT);
+                    }
+                }
+            }
+            vec![]
+        }
 
         UbiCommand::Position { board_a, board_b, clocks } => {
             handle_position_board(state, BoardId::A, board_a);
@@ -132,7 +151,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side);
 
     let mut info_lines = Vec::new();
-    let result = match search::find_best_move_timed(board, budget_ms, &mut info_lines) {
+    let result = match search::find_best_move_timed(board, budget_ms, &mut info_lines, &mut state.tt) {
         Some(r) => r,
         None => {
             warn!("[game:{}] No legal moves on board {:?}", state.game_id, board_id);

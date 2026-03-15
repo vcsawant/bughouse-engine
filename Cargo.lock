@@ -61,7 +61,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "bughouse-chess"
 version = "0.1.0"
-source = "git+https://github.com/vcsawant/bughouse-chess.git?branch=main#8778db609ea3a2ce96e78d83cea6c9eab87001a1"
+source = "git+https://github.com/vcsawant/bughouse-chess.git?branch=main#e5e438a643dfdd0bfcab267c8949b96b7a3e4511"
 dependencies = [
  "arrayvec",
  "nodrop",
