@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (106 unit tests covering protocol, state, evaluation, search, time)
+# Test (112 unit tests covering protocol, state, evaluation, search, TT, quiescence, time)
 cargo test
 ```
 
@@ -192,10 +192,13 @@ Multi-ply search with alpha-beta pruning and iterative deepening. Each board's e
   - `Instant` (< 1s), `Blitz` (< 10s), `Extended` (> 30s with 2x advantage), `Standard` (default)
 
 **Deferred to future optimization:**
-- Quiescence search (searching captures at horizon to avoid tactical blind spots)
-- Transposition table (hash-based position caching)
 - Killer moves and history heuristic for move ordering
 - Continuous background evaluation (pondering) with subtree reuse
+- Delta pruning in quiescence search
+
+**Recently implemented:**
+- Quiescence search: at the search horizon, continues searching capture-only moves until the position is stable. Eliminates tactical blind spots (horizon effect) where the engine would miss recaptures or hanging pieces. Uses `MoveGen::capture_moves()` from the library for efficient capture generation.
+- Transposition table (hash-based position caching with Zobrist keys, 8 MB default, configurable via `setoption name Hash value <MB>`). TT best-move ordering, mate score adjustment, and always-replace policy. Shared across both boards.
 
 ### Phase E — Cross-board strategy layer
 
@@ -208,6 +211,12 @@ The engine understands it's playing bughouse, not just two independent chess gam
 - Wait-vs-move decision logic using P/C values from the partner's board
 - Partner awareness via `teammsg` / `partnermsg`
 - Stall move selection (quiet, non-committal moves when waiting is valuable)
+
+### Alternate architecture: Unified cross-board search
+
+A separate bot variant that treats both boards as a single game, searching a combined state `(board_a, board_b)` with interleaved moves. Eliminates the need for P/C values and a strategy layer — cross-board tactics emerge naturally from the search. See [`docs/UNIFIED_SEARCH.md`](docs/UNIFIED_SEARCH.md) for the full design.
+
+Both bot variants speak UBI and can be compared head-to-head.
 
 ---
 
