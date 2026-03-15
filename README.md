@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (112 unit tests covering protocol, state, evaluation, search, TT, quiescence, time)
+# Test (115 unit tests covering protocol, state, evaluation, search, TT, quiescence, time, cross-board eval)
 cargo test
 ```
 
@@ -200,17 +200,22 @@ Multi-ply search with alpha-beta pruning and iterative deepening. Each board's e
 - Quiescence search: at the search horizon, continues searching capture-only moves until the position is stable. Eliminates tactical blind spots (horizon effect) where the engine would miss recaptures or hanging pieces. Uses `MoveGen::capture_moves()` from the library for efficient capture generation.
 - Transposition table (hash-based position caching with Zobrist keys, 8 MB default, configurable via `setoption name Hash value <MB>`). TT best-move ordering, mate score adjustment, and always-replace policy. Shared across both boards.
 
-### Phase E — Cross-board strategy layer
+### Phase E — Cross-board strategy layer (in progress)
 
 The engine understands it's playing bughouse, not just two independent chess games. The strategy layer combines evaluations from both board processes to make cross-board-aware decisions.
 
-**Deliverables:**
-- Strategy layer that combines board A and board B evaluations at decision time
-- Cross-board minimax: account for captures feeding the other board's reserves
-- Aggressiveness threshold tuning based on time state
-- Wait-vs-move decision logic using P/C values from the partner's board
-- Partner awareness via `teammsg` / `partnermsg`
-- Stall move selection (quiet, non-committal moves when waiting is valuable)
+**E1 — Per-board evaluation state (complete):**
+- `BoardEval` struct per board: P/C capture stats, reserve impact, score, depth
+- Reserve impact via difference search: for each piece type, re-search with that piece added to reserves to measure how much it would help
+- Quick-eval of the non-`go` board to keep both evaluations fresh
+- Both board evaluations logged for debugging
+
+**Remaining deliverables (E2-E6):**
+- Reserve-aware move selection: bonus for captures that feed partner useful pieces
+- Time-aware strategy: full 4-clock analysis, stall willingness, aggressiveness threshold
+- Stall detection: expected value of waiting (P × reserve_impact) vs cost of stalling
+- `teammsg` / `partnermsg` integration
+- Background pondering
 
 ### Alternate architecture: Unified cross-board search
 

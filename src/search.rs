@@ -6,7 +6,7 @@
 
 use bughouse_chess::{
     BitBoard, Board, BoardStatus, BughouseMove, CacheTable, Color, File,
-    MoveGen, Piece, Rank, EMPTY, NUM_NON_KING_PIECES,
+    MoveGen, Piece, Rank, EMPTY, NON_KING_PIECES, NUM_NON_KING_PIECES,
     get_file, get_king_moves, get_king_zone, get_rank,
 };
 
@@ -105,6 +105,32 @@ pub struct SearchResult {
     /// P/C capture statistics for the strategy layer (Phase E).
     #[allow(dead_code)]
     pub capture_stats: CaptureStats,
+}
+
+/// Per-board evaluation state for cross-board strategy.
+///
+/// Stores the results of evaluating a board position: P/C capture statistics,
+/// reserve impact (how much each piece type would improve the position),
+/// and the search score/depth.
+#[derive(Debug, Clone)]
+pub struct BoardEval {
+    pub capture_stats: CaptureStats,
+    /// Score delta if we added one of each piece type to our reserves.
+    /// Indexed by piece type (Pawn=0, Knight=1, Bishop=2, Rook=3, Queen=4).
+    pub reserve_impact: [i32; NUM_NON_KING_PIECES],
+    pub score: i32,
+    pub depth: u32,
+}
+
+impl Default for BoardEval {
+    fn default() -> Self {
+        BoardEval {
+            capture_stats: CaptureStats::default(),
+            reserve_impact: [0; NUM_NON_KING_PIECES],
+            score: 0,
+            depth: 0,
+        }
+    }
 }
 
 /// Per-depth search info for streaming `info` lines.
@@ -584,6 +610,85 @@ fn compute_capture_stats(best_eval: i32, root_evals: &[RootMoveEval], side: Colo
     }
 
     stats
+}
+
+/// Compute reserve impact: how much the score would change if each piece type
+/// were added to reserves. Uses shallow re-searches with the TT warm from
+/// the main search.
+pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTable<TTEntry>) -> [i32; NUM_NON_KING_PIECES] {
+    let color = board.side_to_move();
+    let mut impact = [0i32; NUM_NON_KING_PIECES];
+    let shallow_depth = 3;
+
+    for &piece in &NON_KING_PIECES {
+        let mut hypothetical = *board;
+        hypothetical.add_to_reserve(color, piece);
+
+        // Quick shallow search — TT is warm, most positions are cached
+        let mut local_tt_unused = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        // Use the shared TT for cache hits from the main search
+        let mut ctx = SearchContext {
+            start: std::time::Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt,
+            killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
+        };
+
+        let mut moves = generate_moves(&hypothetical);
+        if moves.is_empty() {
+            continue;
+        }
+        order_moves(&hypothetical, &mut moves, &ctx.history);
+
+        if let Some((_, score, _, _)) = search_at_depth(&hypothetical, &moves, shallow_depth, &mut ctx) {
+            impact[piece.to_index()] = score - base_score;
+        }
+    }
+
+    impact
+}
+
+/// Quick evaluation of a board at a shallow depth. Returns a BoardEval
+/// with P/C and score but no reserve_impact (caller can compute separately).
+pub fn quick_eval(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> BoardEval {
+    let search_depth = depth.max(1);
+    let side = board.side_to_move();
+
+    let mut moves = generate_moves(board);
+    if moves.is_empty() {
+        return BoardEval {
+            score: scoring::evaluate(board),
+            depth: 0,
+            ..Default::default()
+        };
+    }
+
+    let mut ctx = SearchContext {
+        start: std::time::Instant::now(),
+        budget_ms: 0,
+        nodes: 0,
+        time_up: false,
+        tt,
+        killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+        history: [[[0; 64]; 64]; 2],
+    };
+
+    order_moves(board, &mut moves, &ctx.history);
+
+    if let Some((_, score, _, root_evals)) = search_at_depth(board, &moves, search_depth, &mut ctx) {
+        let capture_stats = compute_capture_stats(score, &root_evals, side);
+        BoardEval {
+            capture_stats,
+            reserve_impact: [0; NUM_NON_KING_PIECES],
+            score,
+            depth: search_depth,
+        }
+    } else {
+        BoardEval::default()
+    }
 }
 
 /// Find the best move using iterative deepening with a time budget.

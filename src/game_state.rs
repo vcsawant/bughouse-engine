@@ -8,7 +8,7 @@ use bughouse_chess::{Board, CacheTable};
 use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 
-use crate::search::{self, TTEntry, TT_DEFAULT, TT_DEFAULT_SIZE};
+use crate::search::{self, BoardEval, TTEntry, TT_DEFAULT, TT_DEFAULT_SIZE};
 use crate::strategy;
 use crate::ubi::{BoardId, UbiCommand, UbiResponse, PositionSpec, format_move};
 
@@ -21,6 +21,8 @@ pub struct EngineState {
     pub game_id: String,
     tt: CacheTable<TTEntry>,
     tt_size: usize,
+    /// Per-board evaluation state for cross-board strategy.
+    pub evals: [BoardEval; 2],
 }
 
 impl EngineState {
@@ -32,6 +34,7 @@ impl EngineState {
             game_id,
             tt: CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT),
             tt_size: TT_DEFAULT_SIZE,
+            evals: [BoardEval::default(), BoardEval::default()],
         }
     }
 
@@ -40,6 +43,7 @@ impl EngineState {
         self.boards = [None, None];
         self.clocks = [0; 4];
         self.tt = CacheTable::new(self.tt_size, TT_DEFAULT);
+        self.evals = [BoardEval::default(), BoardEval::default()];
     }
 
     /// Get a reference to the board for the given board id.
@@ -138,7 +142,7 @@ fn handle_position_board(state: &mut EngineState, board_id: BoardId, spec: &Posi
 // ─── Go handling (iterative deepening search) ───────────────────────
 
 fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
-    let board = match &state.boards[board_index(board_id)] {
+    let board = match state.boards[board_index(board_id)] {
         Some(b) => b,
         None => {
             warn!("[game:{}] Go on unset board {:?}", state.game_id, board_id);
@@ -151,7 +155,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side);
 
     let mut info_lines = Vec::new();
-    let result = match search::find_best_move_timed(board, budget_ms, &mut info_lines, &mut state.tt) {
+    let result = match search::find_best_move_timed(&board, budget_ms, &mut info_lines, &mut state.tt) {
         Some(r) => r,
         None => {
             warn!("[game:{}] No legal moves on board {:?}", state.game_id, board_id);
@@ -163,6 +167,39 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
             ];
         }
     };
+
+    // Store BoardEval for the searched board
+    let go_idx = board_index(board_id);
+    let reserve_impact = search::compute_reserve_impact(&board, result.score, &mut state.tt);
+    state.evals[go_idx] = BoardEval {
+        capture_stats: result.capture_stats.clone(),
+        reserve_impact,
+        score: result.score,
+        depth: result.depth,
+    };
+
+    // Quick-eval the other board if available
+    let other_idx = 1 - go_idx;
+    if let Some(other_board) = state.boards[other_idx] {
+        state.evals[other_idx] = search::quick_eval(&other_board, 3, &mut state.tt);
+    }
+
+    // Log both board evaluations
+    let go_eval = &state.evals[go_idx];
+    info!(
+        "[game:{}] Board {:?} eval: score={} depth={} reserve_impact=[P:{} N:{} B:{} R:{} Q:{}]",
+        state.game_id, board_id, go_eval.score, go_eval.depth,
+        go_eval.reserve_impact[0], go_eval.reserve_impact[1],
+        go_eval.reserve_impact[2], go_eval.reserve_impact[3], go_eval.reserve_impact[4]
+    );
+    if state.boards[other_idx].is_some() {
+        let other_id = if board_id == BoardId::A { BoardId::B } else { BoardId::A };
+        let other_eval = &state.evals[other_idx];
+        info!(
+            "[game:{}] Board {:?} eval: score={} depth={}",
+            state.game_id, other_id, other_eval.score, other_eval.depth
+        );
+    }
 
     let chosen_str = format_move(&result.best_move);
 
@@ -489,5 +526,55 @@ mod tests {
             clocks: [170000, 165000, 172000, 168000],
         });
         assert_eq!(state.clocks, [170000, 165000, 172000, 168000]);
+    }
+
+    #[test]
+    fn board_eval_populated_after_go() {
+        let mut state = new_state();
+        set_startpos(&mut state);
+        process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
+
+        // Board A eval should be populated
+        let eval_a = &state.evals[0];
+        assert!(eval_a.depth >= 1, "board A should have been evaluated, depth={}", eval_a.depth);
+
+        // Board B eval should also be populated (quick eval)
+        let eval_b = &state.evals[1];
+        assert!(eval_b.depth >= 1, "board B should have been quick-evaluated, depth={}", eval_b.depth);
+    }
+
+    #[test]
+    fn reserve_impact_queen_is_valuable() {
+        let mut state = new_state();
+        // Open position where a queen drop would be powerful
+        process_command(&mut state, &UbiCommand::Position {
+            board_a: PositionSpec::Bfen(
+                "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR[] w KQkq - 0 1".to_string()
+            ),
+            board_b: PositionSpec::StartPos,
+            clocks: [180000, 180000, 180000, 180000],
+        });
+        process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
+
+        let eval = &state.evals[0];
+        // Queen reserve impact should be the highest (most valuable piece to have)
+        let queen_impact = eval.reserve_impact[Piece::Queen.to_index()];
+        let pawn_impact = eval.reserve_impact[Piece::Pawn.to_index()];
+        assert!(queen_impact > pawn_impact,
+            "queen impact ({}) should exceed pawn impact ({})",
+            queen_impact, pawn_impact
+        );
+    }
+
+    #[test]
+    fn ubinewgame_clears_evals() {
+        let mut state = new_state();
+        set_startpos(&mut state);
+        process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
+        assert!(state.evals[0].depth > 0);
+
+        process_command(&mut state, &UbiCommand::UbiNewGame);
+        assert_eq!(state.evals[0].depth, 0, "evals should be cleared on new game");
+        assert_eq!(state.evals[1].depth, 0);
     }
 }
