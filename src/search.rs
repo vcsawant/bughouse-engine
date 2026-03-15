@@ -123,6 +123,10 @@ const NUM_KILLERS: usize = 2;
 /// Indexed by `[ply][slot]`. Stored as compressed u16 moves.
 type KillerTable = [[u16; NUM_KILLERS]; MAX_DEPTH as usize];
 
+/// History heuristic table: tracks which quiet moves cause beta cutoffs.
+/// Indexed by `[color][source_square][dest_square]`. Higher = search earlier.
+type HistoryTable = [[[i32; 64]; 64]; 2];
+
 /// Shared search state for time management and transposition table.
 struct SearchContext<'a> {
     start: Instant,
@@ -131,6 +135,7 @@ struct SearchContext<'a> {
     time_up: bool,
     tt: &'a mut CacheTable<TTEntry>,
     killers: KillerTable,
+    history: HistoryTable,
 }
 
 // ─── Move Generation ─────────────────────────────────────────────────
@@ -162,8 +167,8 @@ fn generate_moves(board: &Board) -> Vec<BughouseMove> {
 
 /// Score a move for ordering purposes (higher = searched first).
 ///
-/// Priority: captures (MVV-LVA) > promotions > drops (by piece value) > quiet moves.
-fn move_order_score(board: &Board, m: &BughouseMove) -> i32 {
+/// Priority: captures (MVV-LVA) > promotions > drops (by piece value) > quiet moves (history).
+fn move_order_score(board: &Board, m: &BughouseMove, history: &HistoryTable) -> i32 {
     match m {
         BughouseMove::Regular(cm) => {
             let dest = cm.get_dest();
@@ -183,8 +188,11 @@ fn move_order_score(board: &Board, m: &BughouseMove) -> i32 {
                 }
                 // Promotion only
                 (None, true) => 15000,
-                // Quiet move
-                (None, false) => 0,
+                // Quiet move: use history score
+                (None, false) => {
+                    let ci = board.side_to_move().to_index();
+                    history[ci][cm.get_source().to_index()][cm.get_dest().to_index()]
+                }
             }
         }
         BughouseMove::Drop { piece, .. } => {
@@ -215,10 +223,10 @@ fn store_killer(killers: &mut KillerTable, ply: u32, m: u16) {
     killers[p][0] = m;
 }
 
-/// Sort moves for better alpha-beta pruning: captures first (MVV-LVA), then drops, then quiet.
-fn order_moves(board: &Board, moves: &mut [BughouseMove]) {
+/// Sort moves for better alpha-beta pruning: captures first (MVV-LVA), then drops, then quiet (history).
+fn order_moves(board: &Board, moves: &mut [BughouseMove], history: &HistoryTable) {
     moves.sort_by(|a, b| {
-        move_order_score(board, b).cmp(&move_order_score(board, a))
+        move_order_score(board, b, history).cmp(&move_order_score(board, a, history))
     });
 }
 
@@ -289,7 +297,7 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
         return alpha; // Position is quiet
     }
 
-    order_moves(board, &mut captures);
+    order_moves(board, &mut captures, &ctx.history);
 
     for m in &captures {
         if ctx.time_up {
@@ -376,7 +384,7 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
         return scoring::evaluate(board);
     }
 
-    order_moves(board, &mut moves);
+    order_moves(board, &mut moves, &ctx.history);
 
     // TT best move ordering: if we have a TT hit with a best move, put it first
     let mut insert_pos = 0;
@@ -442,9 +450,14 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
             alpha = score;
         }
         if alpha >= beta {
-            // Store killer move if this is a quiet move causing a beta cutoff
+            // Store killer and update history if this is a quiet move causing a beta cutoff
             if is_quiet_move(board, m) {
                 store_killer(&mut ctx.killers, ply, m.compress());
+                if let BughouseMove::Regular(cm) = m {
+                    let ci = board.side_to_move().to_index();
+                    let bonus = (depth * depth) as i32;
+                    ctx.history[ci][cm.get_source().to_index()][cm.get_dest().to_index()] += bonus;
+                }
             }
             break; // Beta cutoff
         }
@@ -583,7 +596,6 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
     if moves.is_empty() {
         return None;
     }
-    order_moves(board, &mut moves);
 
     let us = board.side_to_move();
     let mut ctx = SearchContext {
@@ -593,7 +605,10 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
         time_up: false,
         tt,
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+        history: [[[0; 64]; 64]; 2],
     };
+
+    order_moves(board, &mut moves, &ctx.history);
 
     let mut best_result: Option<SearchResult> = None;
 
@@ -655,7 +670,6 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
     if moves.is_empty() {
         return None;
     }
-    order_moves(board, &mut moves);
 
     let mut local_tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
     let mut ctx = SearchContext {
@@ -665,7 +679,10 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
         time_up: false,
         tt: &mut local_tt,
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+        history: [[[0; 64]; 64]; 2],
     };
+
+    order_moves(board, &mut moves, &ctx.history);
 
     let result = search_at_depth(board, &moves, search_depth, &mut ctx);
 
@@ -931,6 +948,7 @@ mod tests {
             time_up: false,
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
         };
         let score = negamax(&board, 0, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1034,7 +1052,8 @@ mod tests {
                 .parse()
                 .unwrap();
         let mut moves = generate_moves(&board);
-        order_moves(&board, &mut moves);
+        let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
+        order_moves(&board, &mut moves, &empty_history);
 
         // First move should be a capture (Nc3xd5)
         if let Some(BughouseMove::Regular(cm)) = moves.first() {
@@ -1201,6 +1220,7 @@ mod tests {
             time_up: false,
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1232,6 +1252,7 @@ mod tests {
             time_up: false,
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         // Black can capture a knight (+320cp) so quiescence should score
@@ -1260,6 +1281,7 @@ mod tests {
             time_up: false,
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
