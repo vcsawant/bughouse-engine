@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (115 unit tests covering protocol, state, evaluation, search, TT, quiescence, time, cross-board eval)
+# Test (113 unit tests covering protocol, state, evaluation, search, TT, quiescence, time, pondering)
 cargo test
 ```
 
@@ -109,6 +109,7 @@ src/
 ├── main.rs          # Thin I/O loop: stdin → parse → dispatch → format → stdout
 ├── ubi.rs           # UBI protocol parser & formatter (pure data, no I/O)
 ├── game_state.rs    # EngineState + command dispatch → responses (no I/O)
+├── engine.rs        # Multi-threaded eval threads with pondering, EvalCommand/EvalStatus
 ├── strategy.rs      # PlayStyle enum + time-aware style selection (stub for Phase C)
 ├── scoring.rs       # Static evaluation: material, reserves, PSTs, king safety, mobility, pawns
 ├── search.rs        # Alpha-beta negamax with iterative deepening, drop pruning, P/C computation

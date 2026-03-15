@@ -134,6 +134,7 @@ impl Default for BoardEval {
 }
 
 /// Per-depth search info for streaming `info` lines.
+#[derive(Debug, Clone)]
 pub struct SearchInfo {
     pub depth: u32,
     pub score: i32,
@@ -845,6 +846,68 @@ fn build_drop_mask(board: &Board) -> BitBoard {
     attack_zone | defense_zone | extended_center | promo_zone
 }
 
+// ─── Public API for Eval Threads ────────────────────────────────────
+
+/// Public wrapper for generate_moves (used by eval threads).
+pub fn generate_moves_pub(board: &Board) -> Vec<BughouseMove> {
+    generate_moves(board)
+}
+
+/// Public wrapper for order_moves (used by eval threads).
+pub fn order_moves_pub(board: &Board, moves: &mut [BughouseMove]) {
+    let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
+    order_moves(board, moves, &empty_history);
+}
+
+/// Root move evaluation result (public version for eval threads).
+#[derive(Debug, Clone)]
+pub struct RootMoveEvalPub {
+    pub score: i32,
+    pub captured: Option<Piece>,
+}
+
+/// Search at a fixed depth with a provided TT (public version for eval threads).
+/// Returns the best move, score, PV, root move evals, and total node count.
+pub fn search_at_depth_pub(
+    board: &Board,
+    moves: &[BughouseMove],
+    depth: u32,
+    tt: &mut CacheTable<TTEntry>,
+) -> Option<(BughouseMove, i32, Vec<String>, Vec<RootMoveEvalPub>, usize)> {
+    let mut ctx = SearchContext {
+        start: std::time::Instant::now(),
+        budget_ms: 0,
+        nodes: 0,
+        time_up: false,
+        tt,
+        killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+        history: [[[0; 64]; 64]; 2],
+    };
+
+    let result = search_at_depth(board, moves, depth, &mut ctx);
+    result.map(|(best_move, score, pv, root_evals)| {
+        let pub_evals: Vec<RootMoveEvalPub> = root_evals.iter().map(|e| {
+            RootMoveEvalPub {
+                score: e.score,
+                captured: e.captured,
+            }
+        }).collect();
+        (best_move, score, pv, pub_evals, ctx.nodes)
+    })
+}
+
+/// Public wrapper for compute_capture_stats (used by eval threads).
+pub fn compute_capture_stats_pub(best_eval: i32, root_evals: &[RootMoveEvalPub], side: Color) -> CaptureStats {
+    // Convert pub evals to internal format
+    let internal_evals: Vec<RootMoveEval> = root_evals.iter().map(|e| {
+        RootMoveEval {
+            score: e.score,
+            captured: e.captured,
+        }
+    }).collect();
+    compute_capture_stats(best_eval, &internal_evals, side)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1263,26 +1326,44 @@ mod tests {
 
     #[test]
     fn tt_warm_reduces_nodes() {
-        // Search the same position twice with a shared TT.
+        // Search the same position at a fixed depth with a shared TT.
         // The second search should evaluate fewer nodes because
         // the TT is warm from the first search.
         let board = Board::default();
         let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
 
-        let mut info1 = Vec::new();
-        let r1 = find_best_move_timed(&board, 5000, &mut info1, &mut tt).unwrap();
+        // Use fixed depth (not time-based) to avoid CPU contention issues
+        let mut ctx1 = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+            killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
+        };
+        let mut moves = generate_moves(&board);
+        let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
+        order_moves(&board, &mut moves, &empty_history);
+        let _ = search_at_depth(&board, &moves, 4, &mut ctx1);
+        let nodes1 = ctx1.nodes;
 
-        let mut info2 = Vec::new();
-        let r2 = find_best_move_timed(&board, 5000, &mut info2, &mut tt).unwrap();
+        // Second search with warm TT
+        let mut ctx2 = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+            killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
+        };
+        let _ = search_at_depth(&board, &moves, 4, &mut ctx2);
+        let nodes2 = ctx2.nodes;
 
-        // Same depth, same best move
-        assert_eq!(r1.depth, r2.depth, "should reach same depth");
-        assert_eq!(format!("{}", r1.best_move), format!("{}", r2.best_move),
-            "should find same best move");
-        // Second search should use fewer nodes (TT hits skip subtrees)
-        assert!(r2.nodes <= r1.nodes,
-            "warm TT should reduce nodes: first={}, second={}",
-            r1.nodes, r2.nodes
+        assert!(nodes2 <= nodes1,
+            "warm TT should reduce nodes at same depth: first={}, second={}",
+            nodes1, nodes2
         );
     }
 
