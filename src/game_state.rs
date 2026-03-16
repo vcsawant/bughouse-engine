@@ -4,7 +4,7 @@
 //! `process_command()` which maps parsed UBI commands to responses.
 //! No I/O — all output is returned as `Vec<UbiResponse>`.
 
-use bughouse_chess::{Board, CacheTable};
+use bughouse_chess::{Board, CacheTable, Color, Piece, NUM_NON_KING_PIECES};
 use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 use std::time::Instant;
@@ -22,6 +22,11 @@ pub struct EngineState {
     rng: rand::rngs::ThreadRng,
     pub game_id: String,
     eval_handles: [EvalHandle; 2],
+    /// Which boards we currently have active `go` commands for.
+    active_go: [bool; 2],
+    /// Which color is "our team" on each board. Set on first `go` using
+    /// bughouse pairing rule (white on A = black on B).
+    our_color: [Option<Color>; 2],
 }
 
 impl EngineState {
@@ -32,6 +37,8 @@ impl EngineState {
             rng: rand::thread_rng(),
             game_id,
             eval_handles: [engine::spawn_eval_thread(), engine::spawn_eval_thread()],
+            active_go: [false; 2],
+            our_color: [None; 2],
         }
     }
 
@@ -39,6 +46,8 @@ impl EngineState {
     pub fn reset(&mut self) {
         self.boards = [None, None];
         self.clocks = [0; 4];
+        self.active_go = [false; 2];
+        self.our_color = [None; 2];
         // Shut down old eval threads and spawn new ones
         for handle in &self.eval_handles {
             handle.send(EvalCommand::Quit);
@@ -163,6 +172,30 @@ fn handle_position_board(state: &mut EngineState, board_id: BoardId, spec: &Posi
     }
 }
 
+// ─── Cross-Board Strategy ────────────────────────────────────────────
+
+/// Compute the cross-board weight for the Standard strategy.
+///
+/// Determines how much to trust cross-board reserve_impact when adjusting
+/// move scores, based on whether we control the other board and whose turn it is.
+fn cross_board_weight(
+    active_go_other: bool,
+    other_board: Option<&Board>,
+    our_color_on_other: Option<Color>,
+) -> f32 {
+    let our_teams_turn = match (other_board, our_color_on_other) {
+        (Some(b), Some(c)) => b.side_to_move() == c,
+        _ => false, // unknown — conservative
+    };
+
+    match (active_go_other, our_teams_turn) {
+        (true, true)   => 1.0,   // We control both boards, our turn on other
+        (true, false)  => 0.5,   // We control both boards, opponent's turn on other
+        (false, true)  => 0.5,   // Partner controls other board, their turn
+        (false, false) => 0.25,  // Partner controls other, opponent's turn
+    }
+}
+
 // ─── Go handling (uses eval thread pondering) ───────────────────────
 
 fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
@@ -179,6 +212,16 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let side = board.side_to_move();
     let _play_style = strategy::determine_play_style(&state.clocks, board_id, side);
     let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side);
+
+    // Track active go and team colors
+    state.active_go[go_idx] = true;
+    if state.our_color[go_idx].is_none() {
+        // First go — set colors using bughouse pairing rule
+        state.our_color[go_idx] = Some(side);
+        state.our_color[other_idx] = Some(!side);
+        debug!("[game:{}] Team colors set: board {:?}={:?}, other={:?}",
+            state.game_id, board_id, side, !side);
+    }
 
     // Log clock state and budget
     let board_idx = go_idx;
@@ -253,30 +296,83 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
         );
     }
 
-    // Pick the best move from eval results
-    let (chosen_move, chosen_str) = match &eval_status.best_move {
-        Some(m) => (m.clone(), format_move(m)),
-        None => {
-            warn!("[game:{}] No best move from eval thread for board {:?}", state.game_id, board_id);
-            // Resume eval thread before returning
-            state.eval_handles[go_idx].send(EvalCommand::Resume);
-            return vec![
-                UbiResponse::BestMove {
-                    board: board_id,
-                    move_str: "(none)".to_string(),
-                },
-            ];
-        }
-    };
+    // Cross-board move selection
+    let other_eval_status = state.eval_handles[other_idx].status();
+    let has_other_eval = other_eval_status.completed_depth >= 1;
 
-    info!(
-        "[game:{}] Board {:?}: depth {} score {} cp, chose {}",
-        state.game_id, board_id, eval_status.completed_depth,
-        eval_status.best_score, chosen_str
-    );
+    let (chosen_str, cross_board_log) = if has_other_eval && !eval_status.root_moves.is_empty() {
+        // Compute cross-board ranking
+        let ranking = engine::compute_cross_board_ranking(&eval_status, &other_eval_status);
+
+        // Determine weight from Standard strategy
+        let weight = cross_board_weight(
+            state.active_go[other_idx],
+            state.boards[other_idx].as_ref(),
+            state.our_color[other_idx],
+        );
+
+        // Apply weights and pick best adjusted move
+        let mut best_adjusted = i32::MIN;
+        let mut best_move_str = "(none)".to_string();
+        let mut best_log = String::new();
+
+        for am in &ranking.moves {
+            let adjusted = am.local_score + (weight * am.cross_board_value as f32) as i32;
+            if adjusted > best_adjusted {
+                best_adjusted = adjusted;
+                best_move_str = format_move(&am.mv);
+                if am.cross_board_value != 0 {
+                    let piece_name = match am.captured {
+                        Some(Piece::Pawn) => "pawn",
+                        Some(Piece::Knight) => "knight",
+                        Some(Piece::Bishop) => "bishop",
+                        Some(Piece::Rook) => "rook",
+                        Some(Piece::Queen) => "queen",
+                        _ => "?",
+                    };
+                    best_log = format!(
+                        "local={} cross_board={} [{}] weight={:.2} adjusted={}",
+                        am.local_score, am.cross_board_value, piece_name, weight, adjusted
+                    );
+                } else {
+                    best_log = format!("local={} (no cross-board impact)", am.local_score);
+                }
+            }
+        }
+
+        info!(
+            "[game:{}] Board {:?}: depth {} chose {} ({})",
+            state.game_id, board_id, eval_status.completed_depth, best_move_str, best_log
+        );
+
+        (best_move_str, best_log)
+    } else {
+        // No other board eval or no root moves — use eval thread's best move
+        let move_str = match &eval_status.best_move {
+            Some(m) => format_move(m),
+            None => {
+                warn!("[game:{}] No best move from eval thread for board {:?}", state.game_id, board_id);
+                state.active_go[go_idx] = false;
+                state.eval_handles[go_idx].send(EvalCommand::Resume);
+                return vec![
+                    UbiResponse::BestMove {
+                        board: board_id,
+                        move_str: "(none)".to_string(),
+                    },
+                ];
+            }
+        };
+        info!(
+            "[game:{}] Board {:?}: depth {} score {} cp, chose {} (no cross-board data)",
+            state.game_id, board_id, eval_status.completed_depth,
+            eval_status.best_score, move_str
+        );
+        (move_str, String::new())
+    };
 
     // Resume eval thread for continued pondering
     state.eval_handles[go_idx].send(EvalCommand::Resume);
+    state.active_go[go_idx] = false;
 
     // Build response: TeamMsg + per-depth Info lines + BestMove
     let team_msgs = [

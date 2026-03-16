@@ -45,6 +45,71 @@ pub struct RootMoveInfo {
     pub captured: Option<Piece>,
 }
 
+// ─── Cross-Board Analysis ───────────────────────────────────────────
+
+/// A root move annotated with cross-board impact.
+#[derive(Debug, Clone)]
+pub struct AnnotatedMove {
+    pub mv: BughouseMove,
+    pub local_score: i32,
+    pub captured: Option<Piece>,
+    /// Raw, unweighted benefit to the OTHER board from this capture (centipawns).
+    /// 0 if the move is not a capture or the captured piece has no cross-board value.
+    pub cross_board_value: i32,
+}
+
+/// Cross-board ranking for one board, produced by search-level analysis.
+#[derive(Debug, Clone)]
+pub struct CrossBoardRanking {
+    pub board_hash: u64,
+    pub moves: Vec<AnnotatedMove>,
+    /// What pieces the OTHER board needs (reserve_impact from other board's eval).
+    pub other_board_reserve_impact: [i32; NUM_NON_KING_PIECES],
+    /// Depth of the other board's eval (for confidence assessment).
+    pub other_board_depth: u32,
+}
+
+/// Compute cross-board ranking for one board's root moves.
+///
+/// For each root move, annotates with how much the captured piece (if any)
+/// would benefit the other board, based on the other board's reserve_impact.
+/// No weights applied — that's the go handler's job.
+pub fn compute_cross_board_ranking(
+    our_eval: &EvalStatus,
+    other_eval: &EvalStatus,
+) -> CrossBoardRanking {
+    let other_impact = &other_eval.eval.reserve_impact;
+
+    let moves = our_eval.root_moves.iter().map(|rm| {
+        let cross_board_value = match rm.captured {
+            Some(piece) => {
+                let idx = piece.to_index();
+                if idx < NUM_NON_KING_PIECES {
+                    other_impact[idx]
+                } else {
+                    0 // King capture — shouldn't happen but be safe
+                }
+            }
+            None => 0,
+        };
+        AnnotatedMove {
+            mv: rm.mv.clone(),
+            local_score: rm.score,
+            captured: rm.captured,
+            cross_board_value,
+        }
+    }).collect();
+
+    CrossBoardRanking {
+        board_hash: our_eval.board_hash,
+        moves,
+        other_board_reserve_impact: *other_impact,
+        other_board_depth: other_eval.completed_depth,
+    }
+}
+
+// ─── Eval Thread Communication ──────────────────────────────────────
+
 /// Status published by the eval thread, readable by the main/search thread.
 #[derive(Debug, Clone)]
 pub struct EvalStatus {
