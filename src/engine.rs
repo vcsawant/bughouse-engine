@@ -5,6 +5,7 @@
 //! channels (commands) and shared status (Arc<Mutex>).
 
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -141,6 +142,7 @@ pub fn eval_thread_loop(
     let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
     let mut board: Option<Board> = None;
     let mut paused = true; // start paused until we get a position
+    let abort_flag = AtomicBool::new(false);
 
     // Mark as not searching initially
     {
@@ -246,12 +248,14 @@ pub fn eval_thread_loop(
                     EvalCommand::SetDeadline(t) => deadline = Some(t),
                     EvalCommand::Pause => {
                         paused = true;
+                        abort_flag.store(true, Ordering::Relaxed);
                         let mut status = shared.status.lock().unwrap();
                         status.searching = false;
                         shared.paused_cond.notify_all();
                     }
                     EvalCommand::NewPosition(new_b) => {
                         board = Some(new_b);
+                        abort_flag.store(true, Ordering::Relaxed);
                         let mut status = shared.status.lock().unwrap();
                         status.board_hash = new_b.get_hash();
                         status.best_move = None;
@@ -291,9 +295,12 @@ pub fn eval_thread_loop(
                 }
             }
 
-            // Search at this depth
+            // Reset abort flag before searching this depth
+            abort_flag.store(false, Ordering::Relaxed);
+
+            // Search at this depth (abort flag allows mid-depth interruption)
             let search_result = search::search_at_depth_pub(
-                &b, &moves, depth, &mut tt,
+                &b, &moves, depth, &mut tt, Some(&abort_flag),
             );
 
             if let Some((best_move, score, pv, root_evals, nodes)) = search_result {

@@ -163,6 +163,9 @@ struct SearchContext<'a> {
     tt: &'a mut CacheTable<TTEntry>,
     killers: KillerTable,
     history: HistoryTable,
+    /// External abort flag — set by eval thread when position changes or pause requested.
+    /// Checked every TIME_CHECK_INTERVAL nodes alongside time_up.
+    abort: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 // ─── Move Generation ─────────────────────────────────────────────────
@@ -289,11 +292,17 @@ fn make_move(board: &Board, m: &BughouseMove) -> Option<Board> {
 /// the position is quiet. Prevents the horizon effect where the engine
 /// stops looking right before a recapture or tactical sequence.
 fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
-    // Time check
-    if ctx.nodes % TIME_CHECK_INTERVAL == 0 && ctx.budget_ms > 0 {
-        if ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+    // Time check and abort
+    if ctx.nodes % TIME_CHECK_INTERVAL == 0 {
+        if ctx.budget_ms > 0 && ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
             ctx.time_up = true;
             return 0;
+        }
+        if let Some(abort) = ctx.abort {
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                ctx.time_up = true;
+                return 0;
+            }
         }
     }
 
@@ -358,11 +367,17 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
 /// Returns the score from the perspective of `board.side_to_move()`.
 /// `depth` is remaining depth to search. `ply` is distance from root (for mate scoring).
 fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
-    // Check time budget periodically
-    if ctx.nodes % TIME_CHECK_INTERVAL == 0 && ctx.budget_ms > 0 {
-        if ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+    // Check time budget and abort flag periodically
+    if ctx.nodes % TIME_CHECK_INTERVAL == 0 {
+        if ctx.budget_ms > 0 && ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
             ctx.time_up = true;
             return 0;
+        }
+        if let Some(abort) = ctx.abort {
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                ctx.time_up = true;
+                return 0;
+            }
         }
     }
 
@@ -626,8 +641,6 @@ pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTabl
         hypothetical.add_to_reserve(color, piece);
 
         // Quick shallow search — TT is warm, most positions are cached
-        let mut local_tt_unused = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
-        // Use the shared TT for cache hits from the main search
         let mut ctx = SearchContext {
             start: std::time::Instant::now(),
             budget_ms: 0,
@@ -636,6 +649,7 @@ pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTabl
             tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
 
         let mut moves = generate_moves(&hypothetical);
@@ -675,6 +689,7 @@ pub fn quick_eval(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> Bo
         tt,
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
+        abort: None,
     };
 
     order_moves(board, &mut moves, &ctx.history);
@@ -712,6 +727,7 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
         tt,
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
+        abort: None,
     };
 
     order_moves(board, &mut moves, &ctx.history);
@@ -786,6 +802,7 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
         tt: &mut local_tt,
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
+        abort: None,
     };
 
     order_moves(board, &mut moves, &ctx.history);
@@ -873,6 +890,7 @@ pub fn search_at_depth_pub(
     moves: &[BughouseMove],
     depth: u32,
     tt: &mut CacheTable<TTEntry>,
+    abort: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<(BughouseMove, i32, Vec<String>, Vec<RootMoveEvalPub>, usize)> {
     let mut ctx = SearchContext {
         start: std::time::Instant::now(),
@@ -882,6 +900,7 @@ pub fn search_at_depth_pub(
         tt,
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
+        abort,
     };
 
     let result = search_at_depth(board, moves, depth, &mut ctx);
@@ -1117,6 +1136,7 @@ mod tests {
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
         let score = negamax(&board, 0, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1341,6 +1361,7 @@ mod tests {
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
         let mut moves = generate_moves(&board);
         let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
@@ -1357,6 +1378,7 @@ mod tests {
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
         let _ = search_at_depth(&board, &moves, 4, &mut ctx2);
         let nodes2 = ctx2.nodes;
@@ -1407,6 +1429,7 @@ mod tests {
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1439,6 +1462,7 @@ mod tests {
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         // Black can capture a knight (+320cp) so quiescence should score
@@ -1468,6 +1492,7 @@ mod tests {
             tt: &mut tt,
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
+            abort: None,
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);

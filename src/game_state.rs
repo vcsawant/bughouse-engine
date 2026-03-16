@@ -180,6 +180,16 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let _play_style = strategy::determine_play_style(&state.clocks, board_id, side);
     let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side);
 
+    // Log clock state and budget
+    let board_idx = go_idx;
+    let color_idx = side.to_index();
+    let our_time = state.clocks[board_idx * 2 + color_idx];
+    let opp_time = state.clocks[board_idx * 2 + (1 - color_idx)];
+    info!(
+        "[game:{}] Board {:?} go: our_time={}ms opp_time={}ms budget={}ms style={:?}",
+        state.game_id, board_id, our_time, opp_time, budget_ms, _play_style
+    );
+
     // Check if eval thread has pondered results ready
     let eval_status = state.eval_handles[go_idx].status();
     let has_pondered = eval_status.board_hash == board.get_hash()
