@@ -292,17 +292,18 @@ fn make_move(board: &Board, m: &BughouseMove) -> Option<Board> {
 /// the position is quiet. Prevents the horizon effect where the engine
 /// stops looking right before a recapture or tactical sequence.
 fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
-    // Time check and abort
-    if ctx.nodes % TIME_CHECK_INTERVAL == 0 {
-        if ctx.budget_ms > 0 && ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+    // Abort check every node (cheap atomic load)
+    if let Some(abort) = ctx.abort {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
             ctx.time_up = true;
             return 0;
         }
-        if let Some(abort) = ctx.abort {
-            if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                ctx.time_up = true;
-                return 0;
-            }
+    }
+    // Time check periodically (expensive syscall)
+    if ctx.nodes % TIME_CHECK_INTERVAL == 0 && ctx.budget_ms > 0 {
+        if ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+            ctx.time_up = true;
+            return 0;
         }
     }
 
@@ -367,17 +368,18 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
 /// Returns the score from the perspective of `board.side_to_move()`.
 /// `depth` is remaining depth to search. `ply` is distance from root (for mate scoring).
 fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
-    // Check time budget and abort flag periodically
-    if ctx.nodes % TIME_CHECK_INTERVAL == 0 {
-        if ctx.budget_ms > 0 && ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+    // Abort check every node (cheap atomic load)
+    if let Some(abort) = ctx.abort {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
             ctx.time_up = true;
             return 0;
         }
-        if let Some(abort) = ctx.abort {
-            if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                ctx.time_up = true;
-                return 0;
-            }
+    }
+    // Time check periodically (expensive syscall)
+    if ctx.nodes % TIME_CHECK_INTERVAL == 0 && ctx.budget_ms > 0 {
+        if ctx.start.elapsed().as_millis() as u64 >= ctx.budget_ms {
+            ctx.time_up = true;
+            return 0;
         }
     }
 
