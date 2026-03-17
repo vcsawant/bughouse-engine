@@ -346,14 +346,10 @@ pub fn eval_thread_loop(
                 let elapsed = start.elapsed().as_millis() as u64;
                 let capture_stats = search::compute_capture_stats_pub(score, &root_evals, side);
 
-                // Compute reserve impact at depth 4+ (earlier depths are too shallow
-                // to be meaningful, and the computation is expensive — 5 shallow searches
-                // that block the eval thread from deepening)
-                let reserve_impact = if depth >= 4 {
-                    compute_reserve_impact_filtered(&b, score, &mut tt)
-                } else {
-                    [0; NUM_NON_KING_PIECES]
-                };
+                // Reserve impact is NOT computed in the eval thread — it's too expensive
+                // (5 shallow searches that block deepening). The go handler computes it
+                // on-demand if needed.
+                let reserve_impact = [0; NUM_NON_KING_PIECES];
 
                 // Build root move info with actual move data
                 let root_move_infos: Vec<RootMoveInfo> = root_evals.iter().map(|eval| {
