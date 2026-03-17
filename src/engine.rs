@@ -27,9 +27,7 @@ use crate::search::{
 pub enum EvalCommand {
     /// Restart search with a new board position.
     NewPosition(Board),
-    /// Finish current depth and pause by this deadline.
-    SetDeadline(Instant),
-    /// Pause after completing the current depth.
+    /// Pause after completing the current depth (for Stop command).
     Pause,
     /// Resume pondering after a pause.
     Resume,
@@ -146,17 +144,18 @@ impl Default for EvalStatus {
     }
 }
 
-/// Shared eval status with condvar for signaling pause completion.
+/// Shared eval status with condvar for signaling status changes.
 pub struct SharedEvalStatus {
     pub status: Mutex<EvalStatus>,
-    pub paused_cond: Condvar,
+    /// Notified when eval thread completes a depth, pauses, or changes state.
+    pub status_changed: Condvar,
 }
 
 impl SharedEvalStatus {
     pub fn new() -> Self {
         SharedEvalStatus {
             status: Mutex::new(EvalStatus::default()),
-            paused_cond: Condvar::new(),
+            status_changed: Condvar::new(),
         }
     }
 
@@ -164,8 +163,24 @@ impl SharedEvalStatus {
     pub fn wait_for_pause(&self) {
         let mut status = self.status.lock().unwrap();
         while status.searching {
-            status = self.paused_cond.wait(status).unwrap();
+            status = self.status_changed.wait(status).unwrap();
         }
+    }
+
+    /// Wait until the eval thread has completed at least `min_depth`,
+    /// or until `timeout` expires. Returns a snapshot of the status.
+    pub fn wait_for_depth_or_timeout(&self, min_depth: u32, timeout: std::time::Duration) -> EvalStatus {
+        let deadline = Instant::now() + timeout;
+        let mut status = self.status.lock().unwrap();
+        while status.completed_depth < min_depth {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (s, _) = self.status_changed.wait_timeout(status, remaining).unwrap();
+            status = s;
+        }
+        status.clone()
     }
 }
 
@@ -213,7 +228,7 @@ pub fn eval_thread_loop(
     {
         let mut status = shared.status.lock().unwrap();
         status.searching = false;
-        shared.paused_cond.notify_all();
+        shared.status_changed.notify_all();
     }
 
     loop {
@@ -248,7 +263,7 @@ pub fn eval_thread_loop(
                             debug!("Eval thread: quit");
                             return;
                         }
-                        EvalCommand::Pause | EvalCommand::SetDeadline(_) => {
+                        EvalCommand::Pause => {
                             // Already paused, ignore
                         }
                     }
@@ -269,54 +284,23 @@ pub fn eval_thread_loop(
             status.eval.score = scoring::evaluate(&b);
             status.searching = false;
             paused = true;
-            shared.paused_cond.notify_all();
+            shared.status_changed.notify_all();
             continue;
         }
 
-        // Iterative deepening loop
+        // Iterative deepening loop — runs continuously until NewPosition, Pause, or Quit
         let start = Instant::now();
-        let mut deadline: Option<Instant> = None;
-
-        // Check for pending deadline before starting
-        if let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                EvalCommand::SetDeadline(t) => deadline = Some(t),
-                EvalCommand::Pause => {
-                    paused = true;
-                    let mut status = shared.status.lock().unwrap();
-                    status.searching = false;
-                    shared.paused_cond.notify_all();
-                    continue;
-                }
-                EvalCommand::NewPosition(new_b) => {
-                    board = Some(new_b);
-                    let mut status = shared.status.lock().unwrap();
-                    status.board_hash = new_b.get_hash();
-                    status.best_move = None;
-                    status.best_score = 0;
-                    status.completed_depth = 0;
-                    status.eval = BoardEval::default();
-                    status.root_moves.clear();
-                    status.info_lines.clear();
-                    status.searching = true;
-                    continue;
-                }
-                EvalCommand::Quit => return,
-                EvalCommand::Resume => {} // already running
-            }
-        }
 
         for depth in 1..=MAX_DEPTH {
             // Check for commands between depths
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
-                    EvalCommand::SetDeadline(t) => deadline = Some(t),
                     EvalCommand::Pause => {
                         paused = true;
                         abort_flag.store(true, Ordering::Relaxed);
                         let mut status = shared.status.lock().unwrap();
                         status.searching = false;
-                        shared.paused_cond.notify_all();
+                        shared.status_changed.notify_all();
                     }
                     EvalCommand::NewPosition(new_b) => {
                         board = Some(new_b);
@@ -330,6 +314,7 @@ pub fn eval_thread_loop(
                         status.root_moves.clear();
                         status.info_lines.clear();
                         status.searching = true;
+                        shared.status_changed.notify_all();
                     }
                     EvalCommand::Quit => return,
                     EvalCommand::Resume => {
@@ -349,17 +334,6 @@ pub fn eval_thread_loop(
                 break; // restart outer loop with new board
             }
 
-            // Check deadline
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    paused = true;
-                    let mut status = shared.status.lock().unwrap();
-                    status.searching = false;
-                    shared.paused_cond.notify_all();
-                    break;
-                }
-            }
-
             // Reset abort flag before searching this depth
             abort_flag.store(false, Ordering::Relaxed);
 
@@ -377,19 +351,16 @@ pub fn eval_thread_loop(
                     &b, score, &mut tt,
                 );
 
-                // Build root move info from the search results
+                // Build root move info with actual move data
                 let root_move_infos: Vec<RootMoveInfo> = root_evals.iter().map(|eval| {
-                    // Find the move that produced this eval by matching captures
-                    // For now, store score and captured info without the move
-                    // (the move ordering may not match root_evals order)
                     RootMoveInfo {
-                        mv: best_move.clone(), // placeholder — will be refined
+                        mv: eval.mv.clone(),
                         score: eval.score,
                         captured: eval.captured,
                     }
                 }).collect();
 
-                // Update shared status
+                // Update shared status and notify waiters (e.g., main thread in wait_for_depth_or_timeout)
                 {
                     let mut status = shared.status.lock().unwrap();
                     status.best_move = Some(best_move.clone());
@@ -410,34 +381,25 @@ pub fn eval_thread_loop(
                         pv,
                     });
                 }
+                // Notify after releasing the lock
+                shared.status_changed.notify_all();
 
                 // Re-order moves: put best move first for next iteration
                 if let Some(pos) = moves.iter().position(|m| *m == best_move) {
                     moves.swap(0, pos);
                 }
             } else {
-                break; // search failed (time_up or no moves)
-            }
-
-            // Check deadline again after search
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    paused = true;
-                    let mut status = shared.status.lock().unwrap();
-                    status.searching = false;
-                    shared.paused_cond.notify_all();
-                    break;
-                }
+                break; // search failed (aborted or no moves)
             }
         }
 
-        // If we exited the loop without pausing (hit MAX_DEPTH), pause
-        if !paused {
-            paused = true;
+        // If we exited the loop (hit MAX_DEPTH or search failed), wait for next command
+        {
             let mut status = shared.status.lock().unwrap();
             status.searching = false;
-            shared.paused_cond.notify_all();
+            shared.status_changed.notify_all();
         }
+        paused = true;
     }
 }
 
