@@ -139,15 +139,9 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
 
 fn handle_position_board(state: &mut EngineState, board_id: BoardId, spec: &PositionSpec) {
     let board = match spec {
-        PositionSpec::StartPos => {
-            debug!("[game:{}] Board {:?} set to startpos", state.game_id, board_id);
-            Board::default()
-        }
+        PositionSpec::StartPos => Board::default(),
         PositionSpec::Bfen(s) => match s.parse::<Board>() {
-            Ok(b) => {
-                debug!("[game:{}] Board {:?} set from BFEN", state.game_id, board_id);
-                b
-            }
+            Ok(b) => b,
             Err(e) => {
                 warn!("[game:{}] Invalid BFEN for board {:?}: {}", state.game_id, board_id, e);
                 return;
@@ -165,9 +159,17 @@ fn handle_position_board(state: &mut EngineState, board_id: BoardId, spec: &Posi
 
     state.boards[idx] = Some(board);
 
+    // Log position with BFEN and hash
+    debug!(
+        "[game:{}] Board {:?}: {} to move, hash={:#x}{}",
+        state.game_id, board_id,
+        if board.side_to_move() == Color::White { "white" } else { "black" },
+        board.get_hash(),
+        if hash_changed { " (CHANGED)" } else { " (unchanged)" }
+    );
+
     // If position changed, signal eval thread to restart search
     if hash_changed {
-        debug!("[game:{}] Board {:?} position changed, restarting eval", state.game_id, board_id);
         state.eval_handles[idx].send(EvalCommand::NewPosition(board));
     }
 }

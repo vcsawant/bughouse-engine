@@ -545,7 +545,8 @@ fn search_at_depth(board: &Board, moves: &[BughouseMove], depth: u32, ctx: &mut 
     let mut best_pv = Vec::new();
     let mut root_evals = Vec::new();
 
-    for m in moves {
+    let total_moves = moves.len();
+    for (move_idx, m) in moves.iter().enumerate() {
         if ctx.time_up {
             break;
         }
@@ -570,11 +571,20 @@ fn search_at_depth(board: &Board, moves: &[BughouseMove], depth: u32, ctx: &mut 
         root_evals.push(RootMoveEval { mv: m.clone(), score, captured });
 
         if score > best_score {
+            let cap_str = match captured {
+                Some(p) => format!(" captures {:?}", p),
+                None => String::new(),
+            };
+            let prev_str = match &best_move {
+                Some(prev) => format!(" (was {} at {})", prev, best_score),
+                None => String::new(),
+            };
             best_score = score;
             best_move = Some(m.clone());
             best_pv = vec![format!("{}", m)];
 
-            debug!("Root d={}: {} score={} nodes={}", depth, m, score, ctx.nodes);
+            debug!("depth {} [{}/{}] new best: {} score={}{}{} nodes={}",
+                depth, move_idx + 1, total_moves, m, score, cap_str, prev_str, ctx.nodes);
         }
     }
 

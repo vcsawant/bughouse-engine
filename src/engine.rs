@@ -397,6 +397,14 @@ pub fn eval_thread_loop(
                         pv,
                     });
                 }
+                // Log depth completion
+                let num_captures = root_evals.iter().filter(|e| e.captured.is_some()).count();
+                debug!(
+                    "eval depth {} complete: best={} score={} nodes={} time={}ms moves={} (captures={})",
+                    depth, best_move, score, nodes, elapsed,
+                    root_evals.len(), num_captures
+                );
+
                 // Notify after releasing the lock
                 shared.status_changed.notify_all();
 
