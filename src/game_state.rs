@@ -240,8 +240,9 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     // is what actually controls when we stop. This way the condvar wakes us on
     // each completed depth (for future use), and we stop at the budget.
     let timeout = std::time::Duration::from_millis(budget_ms);
+    let expected_hash = board.get_hash();
     let eval_status = state.eval_handles[go_idx].shared
-        .wait_for_depth_or_timeout(64, timeout); // 64 = effectively "wait for timeout"
+        .wait_for_depth_or_timeout(expected_hash, 64, timeout); // 64 = effectively "wait for timeout"
 
     // Peek other board's eval (no waiting, eval thread keeps running)
     let other_eval_status = state.eval_handles[other_idx].status();

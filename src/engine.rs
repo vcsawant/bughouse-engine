@@ -166,12 +166,23 @@ impl SharedEvalStatus {
         }
     }
 
-    /// Wait until the eval thread has completed at least `min_depth`,
-    /// or until `timeout` expires. Returns a snapshot of the status.
-    pub fn wait_for_depth_or_timeout(&self, min_depth: u32, timeout: std::time::Duration) -> EvalStatus {
+    /// Wait until the eval thread has completed at least `min_depth` on the
+    /// expected position (matched by `expected_hash`), or until `timeout` expires.
+    /// Returns a snapshot of the status.
+    ///
+    /// If the eval thread's board_hash doesn't match `expected_hash`, waits for
+    /// it to restart and reach min_depth on the correct position.
+    pub fn wait_for_depth_or_timeout(&self, expected_hash: u64, min_depth: u32, timeout: std::time::Duration) -> EvalStatus {
         let deadline = Instant::now() + timeout;
         let mut status = self.status.lock().unwrap();
-        while status.completed_depth < min_depth {
+        loop {
+            // Check if we have results for the correct position at sufficient depth
+            let correct_position = status.board_hash == expected_hash;
+            let sufficient_depth = status.completed_depth >= min_depth;
+            if correct_position && sufficient_depth {
+                break;
+            }
+
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
