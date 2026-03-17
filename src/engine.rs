@@ -392,7 +392,16 @@ pub fn eval_thread_loop(
             }
         }
 
-        // If we exited the loop (hit MAX_DEPTH or search failed), wait for next command
+        // If we exited the loop, check why:
+        // - If board changed (NewPosition mid-search), continue the outer loop
+        //   to restart with the new board. Do NOT set paused.
+        // - If paused (Pause command or MAX_DEPTH), wait for next command.
+        if !paused && board.map(|b| b.get_hash()) != Some(b.get_hash()) {
+            // Board changed mid-search — restart immediately with new board
+            debug!("Eval thread: position changed mid-search, restarting");
+            continue;
+        }
+        // Otherwise, we're done (MAX_DEPTH, search failed, or paused)
         {
             let mut status = shared.status.lock().unwrap();
             status.searching = false;
