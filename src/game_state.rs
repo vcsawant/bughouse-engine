@@ -246,13 +246,32 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     // Peek other board's eval (no waiting, eval thread keeps running)
     let other_eval_status = state.eval_handles[other_idx].status();
 
+    // Compute reserve impact for the OTHER board (what pieces would help them?)
+    // This runs on the main thread and does NOT block the eval threads.
+    let other_reserve_impact = if other_eval_status.completed_depth >= 1 {
+        if let Some(other_board) = state.boards[other_idx] {
+            let ri = engine::compute_reserve_impact_fast(
+                &other_board,
+                other_eval_status.best_score,
+                2, // depth 2 for drop search — fast but meaningful with quiescence
+            );
+            debug!(
+                "[game:{}] Board {:?} reserve_impact (fast): [P:{} N:{} B:{} R:{} Q:{}]",
+                state.game_id, other_id, ri[0], ri[1], ri[2], ri[3], ri[4]
+            );
+            ri
+        } else {
+            [0; NUM_NON_KING_PIECES]
+        }
+    } else {
+        [0; NUM_NON_KING_PIECES]
+    };
+
     // Log eval results
     let go_eval = &eval_status.eval;
     info!(
-        "[game:{}] Board {:?} eval: score={} depth={} reserve_impact=[P:{} N:{} B:{} R:{} Q:{}]",
+        "[game:{}] Board {:?} eval: score={} depth={}",
         state.game_id, board_id, go_eval.score, go_eval.depth,
-        go_eval.reserve_impact[0], go_eval.reserve_impact[1],
-        go_eval.reserve_impact[2], go_eval.reserve_impact[3], go_eval.reserve_impact[4]
     );
     if other_eval_status.completed_depth >= 1 {
         info!(
@@ -266,7 +285,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let chosen_str = if eval_status.completed_depth >= 1 && !eval_status.root_moves.is_empty() {
         if has_other_eval {
             // Full cross-board analysis
-            let ranking = engine::compute_cross_board_ranking(&eval_status, &other_eval_status);
+            let ranking = engine::compute_cross_board_ranking(&eval_status, &other_reserve_impact, other_eval_status.completed_depth);
             let weight = cross_board_weight(
                 state.active_go[other_idx],
                 state.boards[other_idx].as_ref(),

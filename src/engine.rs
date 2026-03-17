@@ -74,16 +74,15 @@ pub struct CrossBoardRanking {
 /// No weights applied — that's the go handler's job.
 pub fn compute_cross_board_ranking(
     our_eval: &EvalStatus,
-    other_eval: &EvalStatus,
+    other_reserve_impact: &[i32; NUM_NON_KING_PIECES],
+    other_depth: u32,
 ) -> CrossBoardRanking {
-    let other_impact = &other_eval.eval.reserve_impact;
-
     let moves = our_eval.root_moves.iter().map(|rm| {
         let cross_board_value = match rm.captured {
             Some(piece) => {
                 let idx = piece.to_index();
                 if idx < NUM_NON_KING_PIECES {
-                    other_impact[idx]
+                    other_reserve_impact[idx]
                 } else {
                     0 // King capture — shouldn't happen but be safe
                 }
@@ -101,8 +100,8 @@ pub fn compute_cross_board_ranking(
     CrossBoardRanking {
         board_hash: our_eval.board_hash,
         moves,
-        other_board_reserve_impact: *other_impact,
-        other_board_depth: other_eval.completed_depth,
+        other_board_reserve_impact: *other_reserve_impact,
+        other_board_depth: other_depth,
     }
 }
 
@@ -403,26 +402,68 @@ pub fn eval_thread_loop(
     }
 }
 
-/// Compute reserve impact only for pieces not currently in reserves.
-fn compute_reserve_impact_filtered(
+/// Compute reserve impact using targeted drop-only search.
+///
+/// For each piece type not in reserves, generates only drop moves for that piece,
+/// evaluates each drop position, and compares to the eval thread's best score.
+/// Uses the eval thread's best_score as the alpha floor — any drop that doesn't
+/// beat the current best move is pruned immediately.
+///
+/// Called on the main thread during handle_go. Does NOT block the eval thread.
+pub fn compute_reserve_impact_fast(
     board: &Board,
-    base_score: i32,
-    tt: &mut CacheTable<TTEntry>,
+    best_score: i32,
+    search_depth: u32,
 ) -> [i32; NUM_NON_KING_PIECES] {
+    use bughouse_chess::MoveGen;
+
     let color = board.side_to_move();
     let reserves = &board.reserves()[color.to_index()];
     let mut impact = [0i32; NUM_NON_KING_PIECES];
+    let mut tt = CacheTable::new(1 << 16, TT_DEFAULT); // small 512KB TT for drop search
 
     for &piece in &NON_KING_PIECES {
         // Skip pieces we already have in reserves
         if reserves.count(piece) > 0 {
             continue;
         }
+
+        // Create hypothetical board with this piece added to reserves
         let mut hypothetical = *board;
         hypothetical.add_to_reserve(color, piece);
 
-        if let Some(result) = search::find_best_move(&hypothetical, 3) {
-            impact[piece.to_index()] = result.score - base_score;
+        // Generate only drop moves for this piece type
+        let drop_moves: Vec<BughouseMove> = MoveGen::drop_moves(&hypothetical)
+            .into_iter()
+            .filter(|m| matches!(m, BughouseMove::Drop { piece: p, .. } if *p == piece))
+            .collect();
+
+        if drop_moves.is_empty() {
+            continue;
+        }
+
+        // Evaluate each drop: make the drop, then search the resulting position.
+        // Use best_score as alpha floor — only drops better than current best matter.
+        let mut best_drop_score = i32::MIN + 1;
+        for drop_move in &drop_moves {
+            if let Some(child) = match drop_move {
+                BughouseMove::Drop { piece, square } => hypothetical.make_drop_new(*piece, *square),
+                _ => None,
+            } {
+                // Search from opponent's perspective, negate back
+                let score = -search::evaluate_position(&child, search_depth.saturating_sub(1), &mut tt);
+                if score > best_drop_score {
+                    best_drop_score = score;
+                }
+                // Alpha cutoff: if we already found a great drop, skip weaker ones
+                if best_drop_score > best_score + 500 {
+                    break; // clearly impactful, no need to check all squares
+                }
+            }
+        }
+
+        if best_drop_score > i32::MIN + 1 {
+            impact[piece.to_index()] = best_drop_score - best_score;
         }
     }
 

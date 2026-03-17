@@ -877,6 +877,25 @@ fn build_drop_mask(board: &Board) -> BitBoard {
     attack_zone | defense_zone | extended_center | promo_zone
 }
 
+// ─── Public API for Reserve Impact ──────────────────────────────────
+
+/// Evaluate a single position at a given depth using the provided TT.
+/// Returns the score from the perspective of `board.side_to_move()`.
+/// Used for reserve impact computation where we only need a score, not a full SearchResult.
+pub fn evaluate_position(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> i32 {
+    let mut ctx = SearchContext {
+        start: std::time::Instant::now(),
+        budget_ms: 0,
+        nodes: 0,
+        time_up: false,
+        tt,
+        killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+        history: [[[0; 64]; 64]; 2],
+        abort: None,
+    };
+    negamax(board, depth, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx)
+}
+
 // ─── Public API for Eval Threads ────────────────────────────────────
 
 /// Public wrapper for generate_moves (used by eval threads).
