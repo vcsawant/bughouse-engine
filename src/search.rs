@@ -103,8 +103,9 @@ pub struct SearchResult {
     #[allow(dead_code)]
     pub pv: Vec<String>,
     /// P/C capture statistics for the strategy layer (Phase E).
-    #[allow(dead_code)]
     pub capture_stats: CaptureStats,
+    /// All root move evaluations from the last completed depth.
+    pub root_move_evals: Vec<RootMoveEvalPub>,
 }
 
 /// Per-board evaluation state for cross-board strategy.
@@ -529,8 +530,9 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
 
 // ─── Root Search ─────────────────────────────────────────────────────
 
-/// A root move evaluation: its score and what it captures (if anything).
+/// A root move evaluation: its score, the move, and what it captures (if anything).
 struct RootMoveEval {
+    mv: BughouseMove,
     score: i32,
     captured: Option<Piece>,
 }
@@ -565,7 +567,7 @@ fn search_at_depth(board: &Board, moves: &[BughouseMove], depth: u32, ctx: &mut 
             BughouseMove::Drop { .. } => None,
         };
 
-        root_evals.push(RootMoveEval { score, captured });
+        root_evals.push(RootMoveEval { mv: m.clone(), score, captured });
 
         if score > best_score {
             best_score = score;
@@ -762,6 +764,10 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
 
             let capture_stats = compute_capture_stats(score, &root_evals, us);
 
+            let pub_root_evals: Vec<RootMoveEvalPub> = root_evals.iter().map(|e| {
+                RootMoveEvalPub { mv: e.mv.clone(), score: e.score, captured: e.captured }
+            }).collect();
+
             best_result = Some(SearchResult {
                 best_move,
                 score,
@@ -769,6 +775,7 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
                 depth,
                 pv,
                 capture_stats,
+                root_move_evals: pub_root_evals,
             });
 
             if elapsed >= budget_ms {
@@ -814,6 +821,10 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
     result.map(|(best_move, score, pv, root_evals)| {
         let capture_stats = compute_capture_stats(score, &root_evals, us);
         debug!("Best: {} score={} depth={} nodes={}", best_move, score, search_depth, ctx.nodes);
+        let pub_root_evals: Vec<RootMoveEvalPub> = root_evals.iter().map(|e| {
+            RootMoveEvalPub { mv: e.mv.clone(), score: e.score, captured: e.captured }
+        }).collect();
+
         SearchResult {
             best_move,
             score,
@@ -821,6 +832,7 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
             depth: search_depth,
             pv,
             capture_stats,
+            root_move_evals: pub_root_evals,
         }
     })
 }
@@ -878,9 +890,10 @@ pub fn order_moves_pub(board: &Board, moves: &mut [BughouseMove]) {
     order_moves(board, moves, &empty_history);
 }
 
-/// Root move evaluation result (public version for eval threads).
+/// Root move evaluation result (public version for eval threads and cross-board analysis).
 #[derive(Debug, Clone)]
 pub struct RootMoveEvalPub {
+    pub mv: BughouseMove,
     pub score: i32,
     pub captured: Option<Piece>,
 }
@@ -909,6 +922,7 @@ pub fn search_at_depth_pub(
     result.map(|(best_move, score, pv, root_evals)| {
         let pub_evals: Vec<RootMoveEvalPub> = root_evals.iter().map(|e| {
             RootMoveEvalPub {
+                mv: e.mv.clone(),
                 score: e.score,
                 captured: e.captured,
             }
@@ -922,6 +936,7 @@ pub fn compute_capture_stats_pub(best_eval: i32, root_evals: &[RootMoveEvalPub],
     // Convert pub evals to internal format
     let internal_evals: Vec<RootMoveEval> = root_evals.iter().map(|e| {
         RootMoveEval {
+            mv: e.mv.clone(),
             score: e.score,
             captured: e.captured,
         }

@@ -224,6 +224,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     }
 
     // Log clock state and budget
+    let other_id = if board_id == BoardId::A { BoardId::B } else { BoardId::A };
     let board_idx = go_idx;
     let color_idx = side.to_index();
     let our_time = state.clocks[board_idx * 2 + color_idx];
@@ -253,9 +254,103 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
         let mut info_lines = Vec::new();
         let mut fallback_tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
         if let Some(result) = search::find_best_move_timed(&board, budget_ms, &mut info_lines, &mut fallback_tt) {
+            // Check if the other board's eval thread has data for cross-board analysis
+            let other_eval = state.eval_handles[other_idx].status();
+            let chosen_str = if other_eval.completed_depth >= 1 && !result.root_move_evals.is_empty() {
+                // Build EvalStatus from the sync result for cross-board ranking
+                let sync_root_moves: Vec<engine::RootMoveInfo> = result.root_move_evals.iter().map(|e| {
+                    engine::RootMoveInfo {
+                        mv: e.mv.clone(),
+                        score: e.score,
+                        captured: e.captured,
+                    }
+                }).collect();
+                let sync_eval = engine::EvalStatus {
+                    board_hash: board.get_hash(),
+                    best_move: Some(result.best_move.clone()),
+                    best_score: result.score,
+                    completed_depth: result.depth,
+                    eval: search::BoardEval {
+                        capture_stats: result.capture_stats.clone(),
+                        reserve_impact: [0; NUM_NON_KING_PIECES],
+                        score: result.score,
+                        depth: result.depth,
+                    },
+                    root_moves: sync_root_moves,
+                    info_lines: Vec::new(),
+                    searching: false,
+                };
+
+                // Compute cross-board ranking
+                let ranking = engine::compute_cross_board_ranking(&sync_eval, &other_eval);
+                let weight = cross_board_weight(
+                    state.active_go[other_idx],
+                    state.boards[other_idx].as_ref(),
+                    state.our_color[other_idx],
+                );
+
+                // Debug: log what the other board needs
+                let impact = &other_eval.eval.reserve_impact;
+                let piece_names = ["pawn", "knight", "bishop", "rook", "queen"];
+                let mut needs = Vec::new();
+                for (i, name) in piece_names.iter().enumerate() {
+                    if impact[i] != 0 {
+                        needs.push(format!("{}({:+})", name, impact[i]));
+                    }
+                }
+                if !needs.is_empty() {
+                    debug!("[game:{}] Board {:?} needs: {} (depth {})",
+                        state.game_id, other_id, needs.join(", "), other_eval.completed_depth);
+                }
+
+                // Debug: log weight reasoning
+                {
+                    let our_turn_other = match (state.boards[other_idx], state.our_color[other_idx]) {
+                        (Some(b), Some(c)) => if b.side_to_move() == c { "our team's turn" } else { "opponent's turn" },
+                        _ => "unknown",
+                    };
+                    debug!("[game:{}] Cross-board weight: active_go[{:?}]={} other_board={} → weight={:.2}",
+                        state.game_id, other_id, state.active_go[other_idx], our_turn_other, weight);
+                }
+
+                // Apply weights and rank moves
+                let mut scored: Vec<(&engine::AnnotatedMove, i32)> = ranking.moves.iter().map(|am| {
+                    let adjusted = am.local_score + (weight * am.cross_board_value as f32) as i32;
+                    (am, adjusted)
+                }).collect();
+                scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+                // Debug: log top 5 moves
+                for (i, (am, adjusted)) in scored.iter().take(5).enumerate() {
+                    let cap_str = match am.captured {
+                        Some(p) => format!(" captures {:?}", p),
+                        None => String::new(),
+                    };
+                    let cross_str = if am.cross_board_value != 0 {
+                        format!(" cross={:+}×{:.2}={:+}", am.cross_board_value, weight, (am.cross_board_value as f32 * weight) as i32)
+                    } else { String::new() };
+                    debug!("[game:{}] Board {:?} move {}: {} local={:+}{}{} → adjusted={:+}",
+                        state.game_id, board_id, i + 1, format_move(&am.mv), am.local_score, cap_str, cross_str, adjusted);
+                }
+
+                // Check for cross-board override
+                let best_local = scored.iter().max_by_key(|(am, _)| am.local_score);
+                let best_adjusted = &scored[0];
+                if let Some((local_best, _)) = best_local {
+                    if format_move(&local_best.mv) != format_move(&best_adjusted.0.mv) {
+                        info!("[game:{}] Board {:?}: CROSS-BOARD OVERRIDE: {} (adjusted={}) over {} (local best={})",
+                            state.game_id, board_id, format_move(&best_adjusted.0.mv), best_adjusted.1,
+                            format_move(&local_best.mv), local_best.local_score);
+                    }
+                }
+
+                format_move(&scored[0].0.mv)
+            } else {
+                format_move(&result.best_move)
+            };
+
             state.eval_handles[go_idx].send(EvalCommand::Resume);
 
-            let chosen_str = format_move(&result.best_move);
             let team_msgs = ["need n urgency high", "need q urgency medium", "need b",
                 "need r urgency low", "need p", "stall", "threat medium", "material +100"];
             let random_msg = team_msgs.choose(&mut state.rng).unwrap();
@@ -269,6 +364,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
             responses.push(UbiResponse::BestMove {
                 board: board_id, move_str: chosen_str,
             });
+            state.active_go[go_idx] = false;
             return responses;
         }
         // If synchronous search also fails, fall through to "(none)" path below
