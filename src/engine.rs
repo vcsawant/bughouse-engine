@@ -198,12 +198,18 @@ impl SharedEvalStatus {
 pub struct EvalHandle {
     pub cmd_tx: mpsc::Sender<EvalCommand>,
     pub shared: Arc<SharedEvalStatus>,
+    /// Shared abort flag — set by main thread to interrupt mid-depth search.
+    pub abort: Arc<AtomicBool>,
     pub thread: Option<JoinHandle<()>>,
 }
 
 impl EvalHandle {
-    /// Send a command to the eval thread.
+    /// Send a command to the eval thread. For NewPosition, also sets the
+    /// abort flag to interrupt any in-progress search immediately.
     pub fn send(&self, cmd: EvalCommand) {
+        if matches!(cmd, EvalCommand::NewPosition(_) | EvalCommand::Pause) {
+            self.abort.store(true, Ordering::Relaxed);
+        }
         self.cmd_tx.send(cmd).ok();
     }
 
@@ -228,11 +234,11 @@ const MAX_DEPTH: u32 = 64;
 pub fn eval_thread_loop(
     cmd_rx: mpsc::Receiver<EvalCommand>,
     shared: Arc<SharedEvalStatus>,
+    abort_flag: Arc<AtomicBool>,
 ) {
     let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
     let mut board: Option<Board> = None;
     let mut paused = true; // start paused until we get a position
-    let abort_flag = AtomicBool::new(false);
 
     // Mark as not searching initially
     {
@@ -349,7 +355,7 @@ pub fn eval_thread_loop(
 
             // Search at this depth (abort flag allows mid-depth interruption)
             let search_result = search::search_at_depth_pub(
-                &b, &moves, depth, &mut tt, Some(&abort_flag),
+                &b, &moves, depth, &mut tt, Some(&*abort_flag),
             );
 
             if let Some((best_move, score, pv, root_evals, nodes)) = search_result {
@@ -497,14 +503,17 @@ pub fn spawn_eval_thread() -> EvalHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let shared = Arc::new(SharedEvalStatus::new());
     let shared_clone = Arc::clone(&shared);
+    let abort = Arc::new(AtomicBool::new(false));
+    let abort_clone = Arc::clone(&abort);
 
     let thread = thread::spawn(move || {
-        eval_thread_loop(cmd_rx, shared_clone);
+        eval_thread_loop(cmd_rx, shared_clone, abort_clone);
     });
 
     EvalHandle {
         cmd_tx,
         shared,
+        abort,
         thread: Some(thread),
     }
 }
