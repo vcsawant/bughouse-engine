@@ -299,8 +299,9 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     // Cross-board move selection
     let other_eval_status = state.eval_handles[other_idx].status();
     let has_other_eval = other_eval_status.completed_depth >= 1;
+    let other_id = if board_id == BoardId::A { BoardId::B } else { BoardId::A };
 
-    let (chosen_str, cross_board_log) = if has_other_eval && !eval_status.root_moves.is_empty() {
+    let (chosen_str, _cross_board_log) = if has_other_eval && !eval_status.root_moves.is_empty() {
         // Compute cross-board ranking
         let ranking = engine::compute_cross_board_ranking(&eval_status, &other_eval_status);
 
@@ -311,32 +312,83 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
             state.our_color[other_idx],
         );
 
-        // Apply weights and pick best adjusted move
-        let mut best_adjusted = i32::MIN;
-        let mut best_move_str = "(none)".to_string();
-        let mut best_log = String::new();
+        // Debug: log what the other board needs
+        {
+            let impact = &other_eval_status.eval.reserve_impact;
+            let mut needs = Vec::new();
+            let piece_names = ["pawn", "knight", "bishop", "rook", "queen"];
+            for (i, name) in piece_names.iter().enumerate() {
+                if impact[i] != 0 {
+                    needs.push(format!("{}({:+})", name, impact[i]));
+                }
+            }
+            let needs_str = if needs.is_empty() { "nothing".to_string() } else { needs.join(", ") };
+            debug!(
+                "[game:{}] Board {:?} needs from reserves: {} (depth {})",
+                state.game_id, other_id, needs_str, other_eval_status.completed_depth
+            );
+        }
 
+        // Debug: log weight reasoning
+        {
+            let our_turn_other = match (state.boards[other_idx], state.our_color[other_idx]) {
+                (Some(b), Some(c)) => if b.side_to_move() == c { "our team's turn" } else { "opponent's turn" },
+                _ => "unknown",
+            };
+            debug!(
+                "[game:{}] Cross-board weight: active_go[{:?}]={} other_board={} → weight={:.2}",
+                state.game_id, other_id, state.active_go[other_idx], our_turn_other, weight
+            );
+        }
+
+        // Apply weights and rank all moves
+        let mut scored_moves: Vec<(String, i32, i32, i32, Option<Piece>)> = Vec::new(); // (move_str, local, cross, adjusted, captured)
         for am in &ranking.moves {
             let adjusted = am.local_score + (weight * am.cross_board_value as f32) as i32;
-            if adjusted > best_adjusted {
-                best_adjusted = adjusted;
-                best_move_str = format_move(&am.mv);
-                if am.cross_board_value != 0 {
-                    let piece_name = match am.captured {
-                        Some(Piece::Pawn) => "pawn",
-                        Some(Piece::Knight) => "knight",
-                        Some(Piece::Bishop) => "bishop",
-                        Some(Piece::Rook) => "rook",
-                        Some(Piece::Queen) => "queen",
-                        _ => "?",
-                    };
-                    best_log = format!(
-                        "local={} cross_board={} [{}] weight={:.2} adjusted={}",
-                        am.local_score, am.cross_board_value, piece_name, weight, adjusted
-                    );
-                } else {
-                    best_log = format!("local={} (no cross-board impact)", am.local_score);
-                }
+            scored_moves.push((
+                format_move(&am.mv),
+                am.local_score,
+                am.cross_board_value,
+                adjusted,
+                am.captured,
+            ));
+        }
+        scored_moves.sort_by(|a, b| b.3.cmp(&a.3)); // sort by adjusted score desc
+
+        // Debug: log top 5 moves with full breakdown
+        let top_n = scored_moves.len().min(5);
+        for (i, (mv_str, local, cross, adjusted, captured)) in scored_moves.iter().take(top_n).enumerate() {
+            let cap_str = match captured {
+                Some(p) => format!(" captures {:?}", p),
+                None => String::new(),
+            };
+            let cross_str = if *cross != 0 {
+                format!(" cross={:+}×{:.2}={:+}", cross, weight, (*cross as f32 * weight) as i32)
+            } else {
+                String::new()
+            };
+            debug!(
+                "[game:{}] Board {:?} move {}: {} local={:+}{}{} → adjusted={:+}",
+                state.game_id, board_id, i + 1, mv_str, local, cap_str, cross_str, adjusted
+            );
+        }
+
+        // Pick the best adjusted move
+        let (best_move_str, best_local, best_cross, best_adjusted, _) = &scored_moves[0];
+        let best_log = if *best_cross != 0 {
+            format!("local={} cross_board={} weight={:.2} adjusted={}", best_local, best_cross, weight, best_adjusted)
+        } else {
+            format!("local={} (no cross-board impact)", best_local)
+        };
+
+        // Check if cross-board changed the decision
+        let best_local_move = scored_moves.iter().max_by_key(|m| m.1).map(|m| &m.0);
+        if let Some(blm) = best_local_move {
+            if blm != best_move_str {
+                info!(
+                    "[game:{}] Board {:?}: CROSS-BOARD OVERRIDE: {} (adjusted={}) over {} (local best)",
+                    state.game_id, board_id, best_move_str, best_adjusted, blm
+                );
             }
         }
 
@@ -345,7 +397,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
             state.game_id, board_id, eval_status.completed_depth, best_move_str, best_log
         );
 
-        (best_move_str, best_log)
+        (best_move_str.clone(), best_log)
     } else {
         // No other board eval or no root moves — use eval thread's best move
         let move_str = match &eval_status.best_move {
@@ -649,8 +701,8 @@ mod tests {
         let mut state = new_state();
         set_startpos(&mut state);
 
-        // Give eval threads time to ponder
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Give eval threads time to ponder (generous for CI/parallel test runs)
+        std::thread::sleep(std::time::Duration::from_millis(1000));
 
         // Check that eval thread A has been working
         let status = state.eval_handles[0].status();
