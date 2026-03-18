@@ -446,6 +446,33 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let eval_status = state.eval_handles[go_idx].shared
         .wait_for_depth_or_timeout(expected_hash, 64, timeout); // 64 = effectively "wait for timeout"
 
+    // Verify eval thread returned results for the correct position
+    let hash_match = eval_status.board_hash == expected_hash;
+    info!("[game:{}] Board {:?} eval status: hash_match={} expected={:#x} got={:#x} depth={} best_move={:?}",
+        state.game_id, board_id, hash_match, expected_hash, eval_status.board_hash,
+        eval_status.completed_depth, eval_status.best_move.as_ref().map(|m| format!("{}", m)));
+
+    // If hash doesn't match, the eval thread hasn't caught up to the current position.
+    // Fall back to a quick depth-1 search on the correct board to avoid playing
+    // a move from a stale position.
+    if !hash_match {
+        warn!("[game:{}] Board {:?}: HASH MISMATCH — eval thread has stale results, falling back to depth-1 search",
+            state.game_id, board_id);
+        if let Some(result) = crate::search::find_best_move(&board, 1, &state.config) {
+            let move_str = format_move(&result.best_move);
+            info!("[game:{}] Board {:?}: fallback chose {} at depth 1 score={}",
+                state.game_id, board_id, move_str, result.score);
+            state.active_go[go_idx] = false;
+            return vec![
+                UbiResponse::Info {
+                    board: board_id, depth: 1, nodes: result.nodes, time_ms: 0,
+                    score_cp: result.score, pv: vec![move_str.clone()],
+                },
+                UbiResponse::BestMove { board: board_id, move_str },
+            ];
+        }
+    }
+
     // Peek other board's eval (no waiting, eval thread keeps running)
     let other_eval_status = state.eval_handles[other_idx].status();
 
