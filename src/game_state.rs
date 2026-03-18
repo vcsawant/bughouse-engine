@@ -112,6 +112,20 @@ fn piece_to_msg_char(p: Piece) -> &'static str {
     }
 }
 
+// ─── Metadata ───────────────────────────────────────────────────────
+
+/// Format metadata as a space-separated string of key=value pairs for log lines.
+fn format_metadata(metadata: &std::collections::HashMap<String, String>) -> String {
+    if metadata.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<String> = metadata.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
+    pairs.sort(); // deterministic order
+    pairs.join(" ")
+}
+
 // ─── Outgoing Message Generation ────────────────────────────────────
 
 /// Generate contextual team messages based on board evaluation and play style.
@@ -183,6 +197,8 @@ pub struct EngineState {
     partner_state: PartnerState,
     /// Tunable engine parameters.
     pub config: EngineConfig,
+    /// Opaque key-value metadata from the GUI (for logging/analysis only).
+    metadata: std::collections::HashMap<String, String>,
     /// Move counters per board (for game stats).
     move_count: [u32; 2],
     /// Accumulated search depth per board (for average depth).
@@ -206,6 +222,7 @@ impl EngineState {
             book: OpeningBook::new(),
             partner_state: PartnerState::default(),
             config: EngineConfig::default(),
+            metadata: std::collections::HashMap::new(),
             move_count: [0; 2],
             total_depth: [0; 2],
             book_hits: [0; 2],
@@ -263,14 +280,9 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
         UbiCommand::IsReady => vec![UbiResponse::ReadyOk],
 
         UbiCommand::UbiNewGame => {
-            // Log game header with match metadata and config
-            let cfg = &state.config;
-            if !cfg.match_id.is_empty() {
-                info!("=== GAME START === match={} game={}/{} side={} opponent={} time_control={}ms",
-                    cfg.match_id, cfg.game_number, cfg.total_games, cfg.side, cfg.opponent, cfg.time_control);
-            }
-            info!("[game:{}] Config: {}", state.game_id, cfg.tuning_summary());
-            info!("[game:{}] New game — state reset", state.game_id);
+            let meta_str = format_metadata(&state.metadata);
+            info!("=== GAME START === {}", if meta_str.is_empty() { "(no metadata)".to_string() } else { meta_str });
+            info!("[game:{}] Config: {}", state.game_id, state.config.tuning_summary());
             state.reset();
             vec![]
         }
@@ -279,39 +291,42 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
             if let Some(val) = value {
                 if state.config.apply_option(name, val) {
                     info!("[game:{}] Option set: {} = {}", state.game_id, name, val);
-
-                    // Log game footer when GameResult is received
-                    if name.to_lowercase() == "gameresult" {
-                        let avg_depth_a = if state.move_count[0] > 0 {
-                            state.total_depth[0] as f32 / state.move_count[0] as f32
-                        } else { 0.0 };
-                        let avg_depth_b = if state.move_count[1] > 0 {
-                            state.total_depth[1] as f32 / state.move_count[1] as f32
-                        } else { 0.0 };
-                        info!("=== GAME END === result={} moves_A={} moves_B={} \
-                               avg_depth_A={:.1} avg_depth_B={:.1} \
-                               book_hits_A={} book_hits_B={} \
-                               hash_mismatches={} \
-                               time_remaining=[{},{},{},{}]",
-                            val, state.move_count[0], state.move_count[1],
-                            avg_depth_a, avg_depth_b,
-                            state.book_hits[0], state.book_hits[1],
-                            state.hash_mismatches,
-                            state.clocks[0], state.clocks[1],
-                            state.clocks[2], state.clocks[3]);
-                    }
-
-                    // Propagate config to eval threads (skip metadata-only options)
-                    let metadata_options = ["matchid", "gamenumber", "totalgames",
-                                           "side", "opponent", "timecontrol", "gameresult"];
-                    if !metadata_options.contains(&name.to_lowercase().as_str()) {
-                        for handle in &state.eval_handles {
-                            handle.send(EvalCommand::UpdateConfig(state.config.clone()));
-                        }
+                    // Propagate config to eval threads
+                    for handle in &state.eval_handles {
+                        handle.send(EvalCommand::UpdateConfig(state.config.clone()));
                     }
                 } else {
                     debug!("[game:{}] Unknown or invalid option: {} = {}", state.game_id, name, val);
                 }
+            }
+            vec![]
+        }
+
+        UbiCommand::Metadata { key, value } => {
+            state.metadata.insert(key.clone(), value.clone());
+            debug!("[game:{}] Metadata: {} = {}", state.game_id, key, value);
+
+            // Log game footer when game_result is received
+            if key == "game_result" {
+                let avg_depth_a = if state.move_count[0] > 0 {
+                    state.total_depth[0] as f32 / state.move_count[0] as f32
+                } else { 0.0 };
+                let avg_depth_b = if state.move_count[1] > 0 {
+                    state.total_depth[1] as f32 / state.move_count[1] as f32
+                } else { 0.0 };
+                let meta_str = format_metadata(&state.metadata);
+                info!("=== GAME END === {} moves_A={} moves_B={} \
+                       avg_depth_A={:.1} avg_depth_B={:.1} \
+                       book_hits_A={} book_hits_B={} \
+                       hash_mismatches={} \
+                       time_remaining=[{},{},{},{}]",
+                    meta_str,
+                    state.move_count[0], state.move_count[1],
+                    avg_depth_a, avg_depth_b,
+                    state.book_hits[0], state.book_hits[1],
+                    state.hash_mismatches,
+                    state.clocks[0], state.clocks[1],
+                    state.clocks[2], state.clocks[3]);
             }
             vec![]
         }

@@ -38,6 +38,9 @@ pub enum UbiCommand {
     Go { board: BoardId },
     Stop { board: Option<BoardId> },
     PartnerMsg(String),
+    /// Match metadata from the GUI (optional, for logging/analysis).
+    /// Format: `metadata <key> <value>`
+    Metadata { key: String, value: String },
     Quit,
     Unknown(String),
 }
@@ -97,6 +100,16 @@ pub fn parse_command(line: &str) -> Result<UbiCommand, String> {
         "partnermsg" => {
             let body = trimmed.strip_prefix("partnermsg").unwrap().trim().to_string();
             Ok(UbiCommand::PartnerMsg(body))
+        }
+        "metadata" => {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if tokens.len() >= 3 {
+                let key = tokens[1].to_string();
+                let value = tokens[2..].join(" ");
+                Ok(UbiCommand::Metadata { key, value })
+            } else {
+                Err("metadata: expected 'metadata <key> <value>'".to_string())
+            }
         }
 
         _ => Ok(UbiCommand::Unknown(line.to_string())),
