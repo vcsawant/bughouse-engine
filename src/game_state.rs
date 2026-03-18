@@ -6,7 +6,6 @@
 
 use bughouse_chess::{Board, CacheTable, Color, Piece, NUM_NON_KING_PIECES};
 use log::{info, warn, debug};
-use rand::seq::SliceRandom;
 use std::time::Instant;
 
 use crate::book::OpeningBook;
@@ -14,6 +13,156 @@ use crate::engine::{self, EvalCommand, EvalHandle};
 use crate::search::{self, BoardEval, TTEntry, TT_DEFAULT, TT_DEFAULT_SIZE};
 use crate::strategy;
 use crate::ubi::{BoardId, UbiCommand, UbiResponse, PositionSpec, format_move};
+
+// ─── Partner State ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Urgency { Low, Medium, High }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreatLevel { Low, Medium, High, Critical }
+
+/// Parsed state from partner's messages. Updated on each incoming partnermsg.
+#[derive(Debug, Clone)]
+struct PartnerState {
+    needed_piece: Option<(Piece, Urgency)>,
+    threat_level: Option<ThreatLevel>,
+    material: Option<i32>,
+    play_fast: bool,
+    stall: bool,
+}
+
+impl Default for PartnerState {
+    fn default() -> Self {
+        PartnerState {
+            needed_piece: None,
+            threat_level: None,
+            material: None,
+            play_fast: false,
+            stall: false,
+        }
+    }
+}
+
+impl PartnerState {
+    fn parse_message(&mut self, msg: &str) {
+        let parts: Vec<&str> = msg.split_whitespace().collect();
+        if parts.is_empty() { return; }
+
+        match parts[0] {
+            "need" => {
+                if let Some(piece) = parts.get(1).and_then(|p| parse_piece_char(p)) {
+                    let urgency = if parts.get(2) == Some(&"urgency") {
+                        match parts.get(3).copied() {
+                            Some("high") => Urgency::High,
+                            Some("medium") => Urgency::Medium,
+                            _ => Urgency::Low,
+                        }
+                    } else {
+                        Urgency::Medium // default urgency
+                    };
+                    self.needed_piece = Some((piece, urgency));
+                }
+            }
+            "threat" => {
+                self.threat_level = match parts.get(1).copied() {
+                    Some("critical") => Some(ThreatLevel::Critical),
+                    Some("high") => Some(ThreatLevel::High),
+                    Some("medium") => Some(ThreatLevel::Medium),
+                    Some("low") => Some(ThreatLevel::Low),
+                    _ => None,
+                };
+            }
+            "material" => {
+                if let Some(val) = parts.get(1).and_then(|s| s.parse::<i32>().ok()) {
+                    self.material = Some(val);
+                }
+            }
+            "play_fast" => {
+                self.play_fast = true;
+            }
+            "stall" => {
+                self.stall = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_piece_char(s: &str) -> Option<Piece> {
+    match s {
+        "p" | "P" => Some(Piece::Pawn),
+        "n" | "N" => Some(Piece::Knight),
+        "b" | "B" => Some(Piece::Bishop),
+        "r" | "R" => Some(Piece::Rook),
+        "q" | "Q" => Some(Piece::Queen),
+        _ => None,
+    }
+}
+
+fn piece_to_msg_char(p: Piece) -> &'static str {
+    match p {
+        Piece::Pawn => "p",
+        Piece::Knight => "n",
+        Piece::Bishop => "b",
+        Piece::Rook => "r",
+        Piece::Queen => "q",
+        Piece::King => "k",
+    }
+}
+
+// ─── Outgoing Message Generation ────────────────────────────────────
+
+/// Generate contextual team messages based on board evaluation and play style.
+fn generate_team_messages(
+    our_reserve_impact: &[i32; NUM_NON_KING_PIECES],
+    best_score: i32,
+    play_style: strategy::PlayStyle,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    let piece_order = [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen];
+
+    // 1. Need message: find the piece with highest reserve_impact on our board
+    let mut best_impact = 0;
+    let mut best_piece = None;
+    for (i, &piece) in piece_order.iter().enumerate() {
+        if our_reserve_impact[i] > best_impact {
+            best_impact = our_reserve_impact[i];
+            best_piece = Some(piece);
+        }
+    }
+    if best_impact >= 50 {
+        if let Some(piece) = best_piece {
+            let urgency = if best_impact >= 200 { "high" }
+                else if best_impact >= 100 { "medium" }
+                else { "low" };
+            messages.push(format!("need {} urgency {}", piece_to_msg_char(piece), urgency));
+        }
+    }
+
+    // 2. Threat message based on our score
+    if best_score <= -500 {
+        messages.push("threat critical".to_string());
+    } else if best_score <= -200 {
+        messages.push("threat high".to_string());
+    } else if best_score <= -100 {
+        messages.push("threat medium".to_string());
+    } else if best_score <= -50 {
+        messages.push("threat low".to_string());
+    }
+
+    // 3. Material report (rounded to nearest 50)
+    let rounded = (best_score / 50) * 50;
+    let sign = if rounded >= 0 { "+" } else { "" };
+    messages.push(format!("material {}{}", sign, rounded));
+
+    // 4. Play fast if we're in time trouble
+    if matches!(play_style, strategy::PlayStyle::Blitz | strategy::PlayStyle::Instant) {
+        messages.push("play_fast reason time".to_string());
+    }
+
+    messages
+}
 
 // ─── Engine State ────────────────────────────────────────────────────
 
@@ -29,6 +178,8 @@ pub struct EngineState {
     /// bughouse pairing rule (white on A = black on B).
     our_color: [Option<Color>; 2],
     book: OpeningBook,
+    /// Parsed state from partner's messages.
+    partner_state: PartnerState,
 }
 
 impl EngineState {
@@ -42,6 +193,7 @@ impl EngineState {
             active_go: [false; 2],
             our_color: [None; 2],
             book: OpeningBook::new(),
+            partner_state: PartnerState::default(),
         }
     }
 
@@ -56,6 +208,7 @@ impl EngineState {
             handle.send(EvalCommand::Quit);
         }
         self.eval_handles = [engine::spawn_eval_thread(), engine::spawn_eval_thread()];
+        self.partner_state = PartnerState::default();
     }
 
     /// Get a reference to the board for the given board id.
@@ -120,8 +273,9 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
         }
 
         UbiCommand::PartnerMsg(msg) => {
-            debug!("[game:{}] Partner message: {}", state.game_id, msg);
-            vec![]  // Acknowledged, no response (future: influence search)
+            state.partner_state.parse_message(msg);
+            debug!("[game:{}] Partner message: {} → state={:?}", state.game_id, msg, state.partner_state);
+            vec![]
         }
 
         UbiCommand::Quit => {
@@ -215,8 +369,19 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let go_idx = board_index(board_id);
     let other_idx = 1 - go_idx;
     let side = board.side_to_move();
-    let _play_style = strategy::determine_play_style(&state.clocks, board_id, side);
-    let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side);
+    let both_team_active = state.active_go[other_idx]; // other board already has active go
+    let mut play_style = strategy::determine_play_style(&state.clocks, board_id, side, both_team_active);
+
+    // Partner play_fast override: downgrade to Blitz if partner is in time trouble
+    if state.partner_state.play_fast
+        && matches!(play_style, strategy::PlayStyle::Standard | strategy::PlayStyle::Extended)
+    {
+        debug!("[game:{}] Partner requested play_fast — downgrading {:?} to Blitz",
+            state.game_id, play_style);
+        play_style = strategy::PlayStyle::Blitz;
+    }
+
+    let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side, play_style);
 
     // Track active go and team colors
     state.active_go[go_idx] = true;
@@ -236,7 +401,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let opp_time = state.clocks[board_idx * 2 + (1 - color_idx)];
     info!(
         "[game:{}] Board {:?} go: our_time={}ms opp_time={}ms budget={}ms style={:?}",
-        state.game_id, board_id, our_time, opp_time, budget_ms, _play_style
+        state.game_id, board_id, our_time, opp_time, budget_ms, play_style
     );
 
     // Opening book check — instant response if position is in book
@@ -306,12 +471,50 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let chosen_str = if eval_status.completed_depth >= 1 && !eval_status.root_moves.is_empty() {
         if has_other_eval {
             // Full cross-board analysis
-            let ranking = engine::compute_cross_board_ranking(&eval_status, &other_reserve_impact, other_eval_status.completed_depth);
-            let weight = cross_board_weight(
+            // Apply partner need boost: if partner explicitly requested a piece,
+            // amplify that piece's reserve_impact before ranking
+            let mut adjusted_other_ri = other_reserve_impact;
+            if let Some((piece, urgency)) = state.partner_state.needed_piece {
+                let idx = piece.to_index();
+                if idx < NUM_NON_KING_PIECES {
+                    let factor = match urgency {
+                        Urgency::High => 2.0,
+                        Urgency::Medium => 1.5,
+                        Urgency::Low => 1.0,
+                    };
+                    adjusted_other_ri[idx] = (adjusted_other_ri[idx] as f32 * factor) as i32;
+                    if factor > 1.0 {
+                        debug!("[game:{}] Partner needs {:?} (urgency {:?}) — boosting reserve_impact {}→{}",
+                            state.game_id, piece, urgency, other_reserve_impact[idx], adjusted_other_ri[idx]);
+                    }
+                }
+            }
+
+            // If partner is under high/critical threat, boost pawn/knight captures
+            // (defensive pieces for blocking checks and covering squares)
+            if matches!(state.partner_state.threat_level, Some(ThreatLevel::High) | Some(ThreatLevel::Critical)) {
+                let boost = 1.5_f32;
+                adjusted_other_ri[Piece::Pawn.to_index()] = (adjusted_other_ri[Piece::Pawn.to_index()] as f32 * boost) as i32;
+                adjusted_other_ri[Piece::Knight.to_index()] = (adjusted_other_ri[Piece::Knight.to_index()] as f32 * boost) as i32;
+                debug!("[game:{}] Partner threat {:?} — boosting pawn/knight reserve_impact",
+                    state.game_id, state.partner_state.threat_level);
+            }
+
+            let ranking = engine::compute_cross_board_ranking(&eval_status, &adjusted_other_ri, other_eval_status.completed_depth);
+            let base_weight = cross_board_weight(
                 state.active_go[other_idx],
                 state.boards[other_idx].as_ref(),
                 state.our_color[other_idx],
             );
+
+            // Partner stall override: minimize cross-board influence
+            let style_factor = if state.partner_state.stall {
+                debug!("[game:{}] Partner requested stall — minimizing cross-board weight", state.game_id);
+                0.1
+            } else {
+                play_style.style_factor()
+            };
+            let weight = base_weight * style_factor;
 
             // Debug: log what the other board needs
             {
@@ -356,25 +559,38 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
                     state.game_id, board_id, i + 1, mv_str, local, cap_str, cross_str, adjusted);
             }
 
-            // Check for cross-board override
+            // Aggressiveness threshold: only allow cross-board override if the
+            // cross-board value exceeds the threshold for our PlayStyle.
+            let threshold = play_style.aggressiveness_threshold();
             let best_local_move = scored_moves.iter().max_by_key(|m| m.1).map(|m| &m.0);
-            let (best_move_str, _, best_cross, best_adjusted, _) = &scored_moves[0];
-            if let Some(blm) = best_local_move {
-                if blm != best_move_str {
-                    info!("[game:{}] Board {:?}: CROSS-BOARD OVERRIDE: {} (adjusted={}) over {} (local best)",
-                        state.game_id, board_id, best_move_str, best_adjusted, blm);
-                }
-            }
+            let (adjusted_best_str, _, adjusted_best_cross, adjusted_best_score, _) = &scored_moves[0];
 
-            let log_str = if *best_cross != 0 {
-                format!("local cross_board={} weight={:.2} adjusted={}", best_cross, weight, best_adjusted)
+            let chosen = if let Some(blm) = best_local_move {
+                if blm != adjusted_best_str && adjusted_best_cross.abs() < threshold {
+                    // Cross-board adjustment wants to override, but doesn't meet threshold
+                    info!("[game:{}] Board {:?}: cross-board override blocked by {:?} threshold ({} < {}cp), keeping local best {}",
+                        state.game_id, board_id, play_style, adjusted_best_cross, threshold, blm);
+                    blm.clone()
+                } else {
+                    if blm != adjusted_best_str {
+                        info!("[game:{}] Board {:?}: CROSS-BOARD OVERRIDE: {} (adjusted={}) over {} (local best), style={:?}",
+                            state.game_id, board_id, adjusted_best_str, adjusted_best_score, blm, play_style);
+                    }
+                    adjusted_best_str.clone()
+                }
             } else {
-                format!("local (no cross-board impact)")
+                adjusted_best_str.clone()
+            };
+
+            let log_str = if *adjusted_best_cross != 0 {
+                format!("cross_board={} weight={:.2} adjusted={} style={:?}", adjusted_best_cross, weight, adjusted_best_score, play_style)
+            } else {
+                format!("local (no cross-board impact) style={:?}", play_style)
             };
             info!("[game:{}] Board {:?}: depth {} chose {} ({})",
-                state.game_id, board_id, eval_status.completed_depth, best_move_str, log_str);
+                state.game_id, board_id, eval_status.completed_depth, chosen, log_str);
 
-            best_move_str.clone()
+            chosen
         } else {
             // No other board eval — use local best
             let move_str = format_move(eval_status.best_move.as_ref().unwrap());
@@ -400,17 +616,16 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
 
     state.active_go[go_idx] = false;
 
-    // Build response: TeamMsg + per-depth Info lines + BestMove
-    let team_msgs = [
-        "need n urgency high", "need q urgency medium", "need b",
-        "need r urgency low", "need p", "stall", "stall duration 2",
-        "play_fast reason time", "play_fast reason pressure",
-        "threat critical", "threat high", "threat medium", "threat low",
-        "material +100", "material -50",
-    ];
-    let random_msg = team_msgs.choose(&mut state.rng).unwrap();
+    // Build response: TeamMsg(s) + per-depth Info lines + BestMove
+    let team_messages = generate_team_messages(
+        &eval_status.eval.reserve_impact,
+        eval_status.best_score,
+        play_style,
+    );
 
-    let mut responses = vec![UbiResponse::TeamMsg(random_msg.to_string())];
+    let mut responses: Vec<UbiResponse> = team_messages.iter()
+        .map(|msg| UbiResponse::TeamMsg(msg.clone()))
+        .collect();
 
     for info in &eval_status.info_lines {
         responses.push(UbiResponse::Info {
@@ -669,5 +884,124 @@ mod tests {
             status.completed_depth
         );
         assert!(status.best_move.is_some(), "eval thread should have a best move");
+    }
+
+    // ─── Partner State Tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_partner_need_message() {
+        let mut ps = PartnerState::default();
+        ps.parse_message("need n urgency high");
+        assert_eq!(ps.needed_piece, Some((Piece::Knight, Urgency::High)));
+
+        ps.parse_message("need q urgency medium");
+        assert_eq!(ps.needed_piece, Some((Piece::Queen, Urgency::Medium)));
+
+        ps.parse_message("need p");
+        assert_eq!(ps.needed_piece, Some((Piece::Pawn, Urgency::Medium))); // default urgency
+    }
+
+    #[test]
+    fn parse_partner_threat_message() {
+        let mut ps = PartnerState::default();
+        ps.parse_message("threat critical");
+        assert_eq!(ps.threat_level, Some(ThreatLevel::Critical));
+
+        ps.parse_message("threat low");
+        assert_eq!(ps.threat_level, Some(ThreatLevel::Low));
+    }
+
+    #[test]
+    fn parse_partner_material_message() {
+        let mut ps = PartnerState::default();
+        ps.parse_message("material -150");
+        assert_eq!(ps.material, Some(-150));
+
+        ps.parse_message("material +200");
+        assert_eq!(ps.material, Some(200));
+    }
+
+    #[test]
+    fn parse_partner_play_fast_and_stall() {
+        let mut ps = PartnerState::default();
+        assert!(!ps.play_fast);
+        assert!(!ps.stall);
+
+        ps.parse_message("play_fast reason time");
+        assert!(ps.play_fast);
+
+        ps.parse_message("stall");
+        assert!(ps.stall);
+    }
+
+    #[test]
+    fn parse_partner_replaces_previous() {
+        let mut ps = PartnerState::default();
+        ps.parse_message("need n urgency high");
+        ps.parse_message("need q urgency low");
+        // Latest message wins
+        assert_eq!(ps.needed_piece, Some((Piece::Queen, Urgency::Low)));
+    }
+
+    #[test]
+    fn generate_team_messages_need_piece() {
+        // High reserve_impact for knight → "need n urgency high"
+        let ri = [0, 250, 0, 0, 0]; // knight=250cp
+        let msgs = generate_team_messages(&ri, 0, strategy::PlayStyle::Standard);
+        assert!(msgs.iter().any(|m| m == "need n urgency high"),
+            "expected 'need n urgency high' in {:?}", msgs);
+    }
+
+    #[test]
+    fn generate_team_messages_threat() {
+        let ri = [0; NUM_NON_KING_PIECES];
+        let msgs = generate_team_messages(&ri, -300, strategy::PlayStyle::Standard);
+        assert!(msgs.iter().any(|m| m == "threat high"),
+            "expected 'threat high' for score=-300 in {:?}", msgs);
+    }
+
+    #[test]
+    fn generate_team_messages_no_threat_when_positive() {
+        let ri = [0; NUM_NON_KING_PIECES];
+        let msgs = generate_team_messages(&ri, 100, strategy::PlayStyle::Standard);
+        assert!(!msgs.iter().any(|m| m.starts_with("threat")),
+            "should not have threat message for positive score, got {:?}", msgs);
+    }
+
+    #[test]
+    fn generate_team_messages_material_report() {
+        let ri = [0; NUM_NON_KING_PIECES];
+        let msgs = generate_team_messages(&ri, 130, strategy::PlayStyle::Standard);
+        assert!(msgs.iter().any(|m| m == "material +100"),
+            "expected 'material +100' (rounded from 130) in {:?}", msgs);
+    }
+
+    #[test]
+    fn generate_team_messages_play_fast_in_blitz() {
+        let ri = [0; NUM_NON_KING_PIECES];
+        let msgs = generate_team_messages(&ri, 0, strategy::PlayStyle::Blitz);
+        assert!(msgs.iter().any(|m| m == "play_fast reason time"),
+            "expected play_fast in Blitz mode, got {:?}", msgs);
+    }
+
+    #[test]
+    fn generate_team_messages_no_play_fast_in_standard() {
+        let ri = [0; NUM_NON_KING_PIECES];
+        let msgs = generate_team_messages(&ri, 0, strategy::PlayStyle::Standard);
+        assert!(!msgs.iter().any(|m| m.starts_with("play_fast")),
+            "should not have play_fast in Standard mode, got {:?}", msgs);
+    }
+
+    #[test]
+    fn partner_play_fast_overrides_style() {
+        let mut state = new_state();
+        state.partner_state.parse_message("play_fast reason time");
+        set_startpos(&mut state);
+        // With 60s on clock, normally Standard. But partner play_fast → Blitz.
+        state.clocks = [60000, 60000, 60000, 60000];
+        let style = strategy::determine_play_style(&state.clocks, BoardId::A, Color::White, false);
+        assert_eq!(style, strategy::PlayStyle::Standard);
+        // The override happens in handle_go, not in determine_play_style
+        assert!(state.partner_state.play_fast);
     }
 }

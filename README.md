@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (124 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, opening book, time, pondering)
+# Test (145 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, opening book, strategy, time, teammsg, pondering)
 cargo test
 ```
 
@@ -214,11 +214,31 @@ The engine understands it's playing bughouse, not just two independent chess gam
 - Quick-eval of the non-`go` board to keep both evaluations fresh
 - Both board evaluations logged for debugging
 
-**Remaining deliverables (E2-E6):**
+**E2a — Cross-board move selection (complete):**
 - Reserve-aware move selection: bonus for captures that feed partner useful pieces
-- Time-aware strategy: full 4-clock analysis, stall willingness, aggressiveness threshold
+- Cross-board weight based on board control (who has active go, whose turn)
+
+**E3 — Strategy-aware decision making (complete):**
+- PlayStyle (Instant/Blitz/Standard/Extended/Slow) now drives all three decision axes:
+  - **Time budget**: Blitz=time/40 max 500ms, Standard=time/30 max 2s, Extended=time/20 max 4s, Instant=50ms
+  - **Cross-board aggression**: style factor multiplies cross-board weight (0.0 for Instant → 1.5 for Extended)
+  - **Aggressiveness threshold**: minimum cross-board value (cp) before deviating from local best (150cp Blitz, 75cp Standard, 30cp Extended)
+- Both-team-active detection: when both boards have active go (both clocks draining), biases toward Blitz under 15s
+
+**E5 — TeamMsg / PartnerMsg integration (complete):**
+- **Outgoing messages** generated from actual game state:
+  - `need <piece> urgency <level>` — from reserve_impact (impact ≥200cp=high, ≥100cp=medium, ≥50cp=low)
+  - `threat <level>` — from position score (≤-500cp=critical, ≤-200cp=high, ≤-100cp=medium, ≤-50cp=low)
+  - `material <+/-value>` — position score rounded to nearest 50cp
+  - `play_fast reason time` — when in Blitz/Instant time pressure
+- **Incoming messages** parsed into PartnerState and influence behavior:
+  - `need <piece>` — boosts cross-board value for captures of that piece (2x high, 1.5x medium)
+  - `threat high/critical` — boosts pawn/knight capture value (defensive pieces for partner)
+  - `play_fast` — overrides Standard/Extended to Blitz (faster time budget)
+  - `stall` — minimizes cross-board weight (avoid sending pieces to opponent)
+
+**Remaining deliverables (E4, E6):**
 - Stall detection: expected value of waiting (P × reserve_impact) vs cost of stalling
-- `teammsg` / `partnermsg` integration
 - Background pondering
 
 ### Alternate architecture: Unified cross-board search
