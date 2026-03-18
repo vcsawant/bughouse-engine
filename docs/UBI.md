@@ -423,7 +423,89 @@ partnermsg play_fast reason time
 
 ---
 
-## 8. Game Management
+## 8. Metadata (Optional)
+
+### Setting Metadata
+
+**GUI → Engine:** `metadata <key> <value>`
+
+Attach arbitrary key-value metadata to the engine instance. Metadata is purely informational — engines store it for logging and analysis but do not act on it. Keys and values are freeform strings; the engine does not validate them.
+
+Metadata persists for the lifetime of the engine process. Each `metadata` command sets or overwrites the value for that key.
+
+**Examples:**
+```
+metadata match_id bench_20260318_001
+metadata total_games 100
+metadata time_control 120000
+metadata opponent baseline_stable_v1
+metadata game_number 42
+metadata position white_A,black_B
+```
+
+### Conventional Keys
+
+These keys are not required, but using them enables consistent log analysis across different GUIs:
+
+| Key | Description | Example |
+|-----|------------|---------|
+| `match_id` | Unique identifier for a batch of games | `bench_20260318_001` |
+| `total_games` | Number of games in the match | `100` |
+| `time_control` | Starting time in milliseconds | `120000` |
+| `opponent` | Opposing team identifier | `baseline_stable_v1` |
+| `game_number` | Current game number in the match | `42` |
+| `position` | Board seats this engine plays (comma-separated) | `white_A,black_B` |
+| `game_result` | Outcome of the game | `win`, `loss`, `draw`, `timeout` |
+
+### Game Result
+
+When the GUI sends `metadata game_result <value>`, the engine should log a game summary. This is the signal that the game has ended.
+
+**Examples:**
+```
+metadata game_result win
+metadata game_result loss
+metadata game_result draw
+metadata game_result timeout
+```
+
+### Engine Behavior
+
+Engines should:
+- Store all metadata key-value pairs
+- Include metadata in structured log output (game start/end markers)
+- Not change search, evaluation, or move selection based on metadata
+- Gracefully handle unknown keys (store and log them like any other)
+
+### Example: Benchmarking Session
+
+```
+# Match-level metadata (set once)
+metadata match_id bench_20260318_001
+metadata total_games 100
+metadata opponent baseline_stable_v1
+metadata time_control 120000
+
+# Game-level metadata (set before each game)
+metadata game_number 1
+metadata position white_A,black_B
+ubinewgame
+isready
+... position + go commands ...
+metadata game_result win
+
+# Next game
+metadata game_number 2
+metadata position black_A,white_B
+ubinewgame
+isready
+... position + go commands ...
+metadata game_result loss
+```
+
+---
+
+## 9. Game Management
 
 ### New Game
 
@@ -466,7 +548,7 @@ quit
 
 ---
 
-## 9. Complete Example Sessions
+## 10. Complete Example Sessions
 
 ### Example 1: Single Board Engine
 
@@ -594,7 +676,7 @@ GUI → Engine: quit
 
 ---
 
-## 10. Implementation Notes
+## 11. Implementation Notes
 
 ### For Engine Developers
 
@@ -712,7 +794,7 @@ function onCapture(piece, board, capturer) {
 
 ---
 
-## 11. Error Handling
+## 12. Error Handling
 
 ### Invalid Commands
 Engines should ignore invalid commands and continue processing. Optionally, engines can log errors for debugging.
@@ -731,7 +813,7 @@ Return best move found so far.
 
 ---
 
-## 12. Extension Points for Future Versions
+## 13. Extension Points for Future Versions
 
 - **Opening books** - Bughouse-specific opening theory
 - **Endgame tablebases** - For specific reserve configurations
@@ -743,7 +825,7 @@ Return best move found so far.
 
 ---
 
-## 13. Differences from UCI
+## 14. Differences from UCI
 
 | Feature | UCI | UBI |
 |---------|-----|-----|
@@ -757,7 +839,7 @@ Return best move found so far.
 
 ---
 
-## 14. Testing Your Engine
+## 15. Testing Your Engine
 
 ### Basic Tests
 1. Parse `startpos` correctly
@@ -790,7 +872,7 @@ position board A bfen r1bq1rk1/ppp2ppp/2n5/3p4/1bPP4/2N1PN2/PP3PPP/R1BQKB1R[NNPP
 
 ---
 
-## 15. FAQ
+## 16. FAQ
 
 **Q: Do I need to implement both single-board and dual-board modes?**  
 A: No. Start with single-board. Dual-board is an optimization where one engine instance handles both boards.
@@ -818,7 +900,7 @@ A: Parse `~` suffix from BFEN. When capturing `Q~`, add `P` (not `Q`) to partner
 
 ---
 
-## 16. Quick Reference
+## 17. Quick Reference
 
 ### Essential Commands
 ```
@@ -843,6 +925,9 @@ bestmove board <A|B> <move>
 # Team (optional)
 teammsg <type> [params]
 partnermsg <type> [params]
+
+# Metadata (optional)
+metadata <key> <value>
 ```
 
 ### Move Notation
