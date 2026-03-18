@@ -47,6 +47,15 @@ pub struct EngineConfig {
     pub bishop_reserve_pct: i32,
     pub rook_reserve_pct: i32,
     pub queen_reserve_pct: i32,
+
+    // ── Match metadata (set by GUI, used for logging/analysis) ──
+    pub match_id: String,
+    pub game_number: u32,
+    pub total_games: u32,
+    pub side: String,
+    pub opponent: String,
+    pub time_control: u64,
+    pub game_result: String,
 }
 
 impl Default for EngineConfig {
@@ -91,6 +100,15 @@ impl Default for EngineConfig {
             bishop_reserve_pct: 130,
             rook_reserve_pct: 120,
             queen_reserve_pct: 120,
+
+            // Match metadata
+            match_id: String::new(),
+            game_number: 0,
+            total_games: 0,
+            side: String::new(),
+            opponent: String::new(),
+            time_control: 0,
+            game_result: String::new(),
         }
     }
 }
@@ -141,6 +159,15 @@ impl EngineConfig {
             "rookreservepct" => { if let Ok(v) = value.parse() { self.rook_reserve_pct = v; return true; } }
             "queenreservepct" => { if let Ok(v) = value.parse() { self.queen_reserve_pct = v; return true; } }
 
+            // Match metadata
+            "matchid" => { self.match_id = value.to_string(); return true; }
+            "gamenumber" => { if let Ok(v) = value.parse() { self.game_number = v; return true; } }
+            "totalgames" => { if let Ok(v) = value.parse() { self.total_games = v; return true; } }
+            "side" => { self.side = value.to_string(); return true; }
+            "opponent" => { self.opponent = value.to_string(); return true; }
+            "timecontrol" => { if let Ok(v) = value.parse() { self.time_control = v; return true; } }
+            "gameresult" => { self.game_result = value.to_string(); return true; }
+
             _ => {}
         }
         false
@@ -190,6 +217,25 @@ impl EngineConfig {
             crate::strategy::PlayStyle::Extended => self.extended_aggression,
             crate::strategy::PlayStyle::Slow => 200,
         }
+    }
+
+    /// One-line summary of tunable parameters for game header logging.
+    pub fn tuning_summary(&self) -> String {
+        format!(
+            "P={} N={} B={} R={} Q={} res=[{}%,{}%,{}%,{}%,{}%] \
+             style=[{:.1},{:.1},{:.1}] aggr=[{},{},{}] \
+             time=[{}/{}/{}/{}/{}] clocks=[{},{},{},{}]",
+            self.pawn_value, self.knight_value, self.bishop_value,
+            self.rook_value, self.queen_value,
+            self.pawn_reserve_pct, self.knight_reserve_pct, self.bishop_reserve_pct,
+            self.rook_reserve_pct, self.queen_reserve_pct,
+            self.blitz_style_factor, self.standard_style_factor, self.extended_style_factor,
+            self.blitz_aggression, self.standard_aggression, self.extended_aggression,
+            self.blitz_divisor, self.standard_divisor, self.extended_divisor,
+            self.blitz_cap_ms, self.standard_cap_ms,
+            self.instant_time_ms, self.blitz_time_ms,
+            self.extended_advantage_ms, self.both_active_blitz_ms,
+        )
     }
 }
 

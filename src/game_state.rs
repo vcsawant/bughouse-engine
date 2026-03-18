@@ -183,6 +183,14 @@ pub struct EngineState {
     partner_state: PartnerState,
     /// Tunable engine parameters.
     pub config: EngineConfig,
+    /// Move counters per board (for game stats).
+    move_count: [u32; 2],
+    /// Accumulated search depth per board (for average depth).
+    total_depth: [u32; 2],
+    /// Book hit counters per board.
+    book_hits: [u32; 2],
+    /// Hash mismatch counter.
+    hash_mismatches: u32,
 }
 
 impl EngineState {
@@ -198,6 +206,10 @@ impl EngineState {
             book: OpeningBook::new(),
             partner_state: PartnerState::default(),
             config: EngineConfig::default(),
+            move_count: [0; 2],
+            total_depth: [0; 2],
+            book_hits: [0; 2],
+            hash_mismatches: 0,
         }
     }
 
@@ -213,6 +225,10 @@ impl EngineState {
         }
         self.eval_handles = [engine::spawn_eval_thread(), engine::spawn_eval_thread()];
         self.partner_state = PartnerState::default();
+        self.move_count = [0; 2];
+        self.total_depth = [0; 2];
+        self.book_hits = [0; 2];
+        self.hash_mismatches = 0;
     }
 
     /// Get a reference to the board for the given board id.
@@ -247,6 +263,13 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
         UbiCommand::IsReady => vec![UbiResponse::ReadyOk],
 
         UbiCommand::UbiNewGame => {
+            // Log game header with match metadata and config
+            let cfg = &state.config;
+            if !cfg.match_id.is_empty() {
+                info!("=== GAME START === match={} game={}/{} side={} opponent={} time_control={}ms",
+                    cfg.match_id, cfg.game_number, cfg.total_games, cfg.side, cfg.opponent, cfg.time_control);
+            }
+            info!("[game:{}] Config: {}", state.game_id, cfg.tuning_summary());
             info!("[game:{}] New game — state reset", state.game_id);
             state.reset();
             vec![]
@@ -256,9 +279,35 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
             if let Some(val) = value {
                 if state.config.apply_option(name, val) {
                     info!("[game:{}] Option set: {} = {}", state.game_id, name, val);
-                    // Propagate config to eval threads
-                    for handle in &state.eval_handles {
-                        handle.send(EvalCommand::UpdateConfig(state.config.clone()));
+
+                    // Log game footer when GameResult is received
+                    if name.to_lowercase() == "gameresult" {
+                        let avg_depth_a = if state.move_count[0] > 0 {
+                            state.total_depth[0] as f32 / state.move_count[0] as f32
+                        } else { 0.0 };
+                        let avg_depth_b = if state.move_count[1] > 0 {
+                            state.total_depth[1] as f32 / state.move_count[1] as f32
+                        } else { 0.0 };
+                        info!("=== GAME END === result={} moves_A={} moves_B={} \
+                               avg_depth_A={:.1} avg_depth_B={:.1} \
+                               book_hits_A={} book_hits_B={} \
+                               hash_mismatches={} \
+                               time_remaining=[{},{},{},{}]",
+                            val, state.move_count[0], state.move_count[1],
+                            avg_depth_a, avg_depth_b,
+                            state.book_hits[0], state.book_hits[1],
+                            state.hash_mismatches,
+                            state.clocks[0], state.clocks[1],
+                            state.clocks[2], state.clocks[3]);
+                    }
+
+                    // Propagate config to eval threads (skip metadata-only options)
+                    let metadata_options = ["matchid", "gamenumber", "totalgames",
+                                           "side", "opponent", "timecontrol", "gameresult"];
+                    if !metadata_options.contains(&name.to_lowercase().as_str()) {
+                        for handle in &state.eval_handles {
+                            handle.send(EvalCommand::UpdateConfig(state.config.clone()));
+                        }
                     }
                 } else {
                     debug!("[game:{}] Unknown or invalid option: {} = {}", state.game_id, name, val);
@@ -424,8 +473,10 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     // Opening book check — instant response if position is in book
     if let Some(book_move) = state.book.lookup(&board, &mut state.rng) {
         let move_str = format_move(&book_move);
-        info!("[game:{}] Board {:?}: BOOK HIT — playing {} instantly",
-            state.game_id, board_id, move_str);
+        state.move_count[go_idx] += 1;
+        state.book_hits[go_idx] += 1;
+        info!("MOVE board={:?} move={} score=0 depth=0 nodes=0 time_ms=0 style={:?} book=true hash_match=true",
+            board_id, move_str, play_style);
         state.active_go[go_idx] = false;
         return vec![
             UbiResponse::Info {
@@ -456,12 +507,15 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     // Fall back to a quick depth-1 search on the correct board to avoid playing
     // a move from a stale position.
     if !hash_match {
+        state.hash_mismatches += 1;
         warn!("[game:{}] Board {:?}: HASH MISMATCH — eval thread has stale results, falling back to depth-1 search",
             state.game_id, board_id);
         if let Some(result) = crate::search::find_best_move(&board, 1, &state.config) {
             let move_str = format_move(&result.best_move);
-            info!("[game:{}] Board {:?}: fallback chose {} at depth 1 score={}",
-                state.game_id, board_id, move_str, result.score);
+            state.move_count[go_idx] += 1;
+            state.total_depth[go_idx] += 1;
+            info!("MOVE board={:?} move={} score={} depth=1 nodes={} time_ms=0 style={:?} book=false hash_match=false",
+                board_id, move_str, result.score, result.nodes, play_style);
             state.active_go[go_idx] = false;
             return vec![
                 UbiResponse::Info {
@@ -662,6 +716,15 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     };
 
     state.active_go[go_idx] = false;
+
+    // Update game stats and log per-move summary
+    state.move_count[go_idx] += 1;
+    state.total_depth[go_idx] += eval_status.completed_depth;
+    let elapsed_ms = eval_status.info_lines.last().map(|i| i.time_ms).unwrap_or(0);
+    let total_nodes = eval_status.info_lines.last().map(|i| i.nodes).unwrap_or(0);
+    info!("MOVE board={:?} move={} score={} depth={} nodes={} time_ms={} style={:?} book=false hash_match=true",
+        board_id, chosen_str, eval_status.best_score, eval_status.completed_depth,
+        total_nodes, elapsed_ms, play_style);
 
     // Build response: TeamMsg(s) + per-depth Info lines + BestMove
     let team_messages = generate_team_messages(
