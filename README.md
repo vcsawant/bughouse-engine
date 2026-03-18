@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (145 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, opening book, strategy, time, teammsg, pondering)
+# Test (152 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, opening book, strategy, time, teammsg, config, pondering)
 cargo test
 ```
 
@@ -236,6 +236,18 @@ The engine understands it's playing bughouse, not just two independent chess gam
   - `threat high/critical` — boosts pawn/knight capture value (defensive pieces for partner)
   - `play_fast` — overrides Standard/Extended to Blitz (faster time budget)
   - `stall` — minimizes cross-board weight (avoid sending pieces to opponent)
+
+**Tunable parameters via `setoption`:**
+
+All strategy, time, and evaluation parameters are configurable at runtime via UBI `setoption` commands. 28 parameters across three categories:
+
+| Category | Examples |
+|----------|---------|
+| Strategy thresholds | `InstantTime`, `BlitzTime`, `ExtendedAdvantage`, style factors, aggression thresholds |
+| Time budget | `BlitzDivisor`, `StandardCap`, `ExtendedDivisor` |
+| Piece values & reserves | `PawnValue`, `KnightValue`, `KnightReservePct` |
+
+Example: `setoption name BlitzStyleFactor value 0.7`
 
 **Remaining deliverables (E4, E6):**
 - Stall detection: expected value of waiting (P × reserve_impact) vs cost of stalling

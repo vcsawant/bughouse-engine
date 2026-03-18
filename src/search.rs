@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use std::time::Instant;
 use log::debug;
 
+use crate::config::EngineConfig;
 use crate::scoring;
 
 // ─── Transposition Table ────────────────────────────────────────────
@@ -190,6 +191,8 @@ struct SearchContext<'a> {
     /// External abort flag — set by eval thread when position changes or pause requested.
     /// Checked every TIME_CHECK_INTERVAL nodes alongside time_up.
     abort: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Engine config for piece values, reserve multipliers, etc.
+    config: &'a EngineConfig,
 }
 
 // ─── Move Generation ─────────────────────────────────────────────────
@@ -222,7 +225,7 @@ fn generate_moves(board: &Board) -> Vec<BughouseMove> {
 /// Score a move for ordering purposes (higher = searched first).
 ///
 /// Priority: captures (MVV-LVA) > promotions > drops (by piece value) > quiet moves (history).
-fn move_order_score(board: &Board, m: &BughouseMove, history: &HistoryTable) -> i32 {
+fn move_order_score(board: &Board, m: &BughouseMove, history: &HistoryTable, config: &EngineConfig) -> i32 {
     match m {
         BughouseMove::Regular(cm) => {
             let dest = cm.get_dest();
@@ -232,13 +235,13 @@ fn move_order_score(board: &Board, m: &BughouseMove, history: &HistoryTable) -> 
             match (victim, is_promotion) {
                 // Capture + promotion
                 (Some(v), true) => {
-                    20000 + scoring::piece_value(v) * 10 + 900
+                    20000 + config.piece_value(v) * 10 + 900
                 }
                 // Capture only (MVV-LVA)
                 (Some(v), false) => {
                     let source = cm.get_source();
                     let attacker = board.piece_on(source).unwrap_or(Piece::Pawn);
-                    20000 + scoring::piece_value(v) * 10 - scoring::piece_value(attacker)
+                    20000 + config.piece_value(v) * 10 - config.piece_value(attacker)
                 }
                 // Promotion only
                 (None, true) => 15000,
@@ -251,7 +254,7 @@ fn move_order_score(board: &Board, m: &BughouseMove, history: &HistoryTable) -> 
         }
         BughouseMove::Drop { piece, .. } => {
             // Drops: queen drops first, then rook, etc.
-            10000 + scoring::piece_value(*piece)
+            10000 + config.piece_value(*piece)
         }
     }
 }
@@ -278,9 +281,9 @@ fn store_killer(killers: &mut KillerTable, ply: u32, m: u16) {
 }
 
 /// Sort moves for better alpha-beta pruning: captures first (MVV-LVA), then drops, then quiet (history).
-fn order_moves(board: &Board, moves: &mut [BughouseMove], history: &HistoryTable) {
+fn order_moves(board: &Board, moves: &mut [BughouseMove], history: &HistoryTable, config: &EngineConfig) {
     moves.sort_by(|a, b| {
-        move_order_score(board, b, history).cmp(&move_order_score(board, a, history))
+        move_order_score(board, b, history, config).cmp(&move_order_score(board, a, history, config))
     });
 }
 
@@ -339,7 +342,7 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
     }
 
     ctx.nodes += 1;
-    let stand_pat = scoring::evaluate(board);
+    let stand_pat = scoring::evaluate_with_config(board, ctx.config);
 
     // Beta cutoff: position is already good enough without capturing
     if stand_pat >= beta {
@@ -358,7 +361,7 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
         return alpha; // Position is quiet
     }
 
-    order_moves(board, &mut captures, &ctx.history);
+    order_moves(board, &mut captures, &ctx.history, ctx.config);
 
     for m in &captures {
         if ctx.time_up {
@@ -449,10 +452,10 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
     // No moves but not checkmate/stalemate (shouldn't happen with correct move gen, but be safe)
     if moves.is_empty() {
         ctx.nodes += 1;
-        return scoring::evaluate(board);
+        return scoring::evaluate_with_config(board, ctx.config);
     }
 
-    order_moves(board, &mut moves, &ctx.history);
+    order_moves(board, &mut moves, &ctx.history, ctx.config);
 
     // TT best move ordering: if we have a TT hit with a best move, put it first
     let mut insert_pos = 0;
@@ -699,7 +702,7 @@ fn compute_capture_stats(best_eval: i32, root_evals: &[RootMoveEval], side: Colo
 /// Compute reserve impact: how much the score would change if each piece type
 /// were added to reserves. Uses shallow re-searches with the TT warm from
 /// the main search.
-pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTable<TTEntry>) -> [i32; NUM_NON_KING_PIECES] {
+pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTable<TTEntry>, config: &EngineConfig) -> [i32; NUM_NON_KING_PIECES] {
     let color = board.side_to_move();
     let mut impact = [0i32; NUM_NON_KING_PIECES];
     let shallow_depth = 3;
@@ -718,13 +721,14 @@ pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTabl
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config,
         };
 
         let mut moves = generate_moves(&hypothetical);
         if moves.is_empty() {
             continue;
         }
-        order_moves(&hypothetical, &mut moves, &ctx.history);
+        order_moves(&hypothetical, &mut moves, &ctx.history, ctx.config);
 
         if let Some((_, score, _, _)) = search_at_depth(&hypothetical, &moves, shallow_depth, &mut ctx) {
             impact[piece.to_index()] = score - base_score;
@@ -736,14 +740,14 @@ pub fn compute_reserve_impact(board: &Board, base_score: i32, tt: &mut CacheTabl
 
 /// Quick evaluation of a board at a shallow depth. Returns a BoardEval
 /// with P/C and score but no reserve_impact (caller can compute separately).
-pub fn quick_eval(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> BoardEval {
+pub fn quick_eval(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>, config: &EngineConfig) -> BoardEval {
     let search_depth = depth.max(1);
     let side = board.side_to_move();
 
     let mut moves = generate_moves(board);
     if moves.is_empty() {
         return BoardEval {
-            score: scoring::evaluate(board),
+            score: scoring::evaluate_with_config(board, config),
             depth: 0,
             ..Default::default()
         };
@@ -758,9 +762,10 @@ pub fn quick_eval(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> Bo
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
         abort: None,
+        config,
     };
 
-    order_moves(board, &mut moves, &ctx.history);
+    order_moves(board, &mut moves, &ctx.history, ctx.config);
 
     if let Some((_, score, _, root_evals)) = search_at_depth(board, &moves, search_depth, &mut ctx) {
         let capture_stats = compute_capture_stats(score, &root_evals, side);
@@ -780,7 +785,7 @@ pub fn quick_eval(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> Bo
 /// Searches depth 1, 2, 3, ... until `budget_ms` expires. Depth 1 always
 /// completes regardless of budget. Each completed depth pushes a `SearchInfo`
 /// into `info_sink`. Returns `None` if there are no legal moves.
-pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<SearchInfo>, tt: &mut CacheTable<TTEntry>) -> Option<SearchResult> {
+pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<SearchInfo>, tt: &mut CacheTable<TTEntry>, config: &EngineConfig) -> Option<SearchResult> {
     let mut moves = generate_moves(board);
     if moves.is_empty() {
         return None;
@@ -796,9 +801,10 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
         abort: None,
+        config,
     };
 
-    order_moves(board, &mut moves, &ctx.history);
+    order_moves(board, &mut moves, &ctx.history, ctx.config);
 
     let mut best_result: Option<SearchResult> = None;
 
@@ -857,7 +863,7 @@ pub fn find_best_move_timed(board: &Board, budget_ms: u64, info_sink: &mut Vec<S
 ///
 /// Convenience function for tests and cases where a specific depth is desired.
 #[allow(dead_code)]
-pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
+pub fn find_best_move(board: &Board, depth: u32, config: &EngineConfig) -> Option<SearchResult> {
     let search_depth = depth.min(MAX_DEPTH).max(1);
     let us = board.side_to_move();
 
@@ -876,9 +882,10 @@ pub fn find_best_move(board: &Board, depth: u32) -> Option<SearchResult> {
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
         abort: None,
+        config,
     };
 
-    order_moves(board, &mut moves, &ctx.history);
+    order_moves(board, &mut moves, &ctx.history, ctx.config);
 
     let result = search_at_depth(board, &moves, search_depth, &mut ctx);
 
@@ -946,7 +953,7 @@ fn build_drop_mask(board: &Board) -> BitBoard {
 /// Evaluate a single position at a given depth using the provided TT.
 /// Returns the score from the perspective of `board.side_to_move()`.
 /// Used for reserve impact computation where we only need a score, not a full SearchResult.
-pub fn evaluate_position(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>) -> i32 {
+pub fn evaluate_position(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>, config: &EngineConfig) -> i32 {
     let mut ctx = SearchContext {
         start: std::time::Instant::now(),
         budget_ms: 0,
@@ -956,6 +963,7 @@ pub fn evaluate_position(board: &Board, depth: u32, tt: &mut CacheTable<TTEntry>
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
         abort: None,
+        config,
     };
     negamax(board, depth, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx)
 }
@@ -968,9 +976,9 @@ pub fn generate_moves_pub(board: &Board) -> Vec<BughouseMove> {
 }
 
 /// Public wrapper for order_moves (used by eval threads).
-pub fn order_moves_pub(board: &Board, moves: &mut [BughouseMove]) {
+pub fn order_moves_pub(board: &Board, moves: &mut [BughouseMove], config: &EngineConfig) {
     let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
-    order_moves(board, moves, &empty_history);
+    order_moves(board, moves, &empty_history, config);
 }
 
 /// Root move evaluation result (public version for eval threads and cross-board analysis).
@@ -989,6 +997,7 @@ pub fn search_at_depth_pub(
     depth: u32,
     tt: &mut CacheTable<TTEntry>,
     abort: Option<&std::sync::atomic::AtomicBool>,
+    config: &EngineConfig,
 ) -> Option<(BughouseMove, i32, Vec<String>, Vec<RootMoveEvalPub>, usize)> {
     let mut ctx = SearchContext {
         start: std::time::Instant::now(),
@@ -999,6 +1008,7 @@ pub fn search_at_depth_pub(
         killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
         history: [[[0; 64]; 64]; 2],
         abort,
+        config,
     };
 
     let result = search_at_depth(board, moves, depth, &mut ctx);
@@ -1036,7 +1046,7 @@ mod tests {
 
     /// Helper: search at a fixed depth for tests.
     fn search(board: &Board, depth: u32) -> Option<SearchResult> {
-        find_best_move(board, depth)
+        find_best_move(board, depth, &EngineConfig::default())
     }
 
     #[test]
@@ -1237,6 +1247,7 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let score = negamax(&board, 0, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1312,7 +1323,7 @@ mod tests {
         let mut info_sink = Vec::new();
         let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
         // Give generous budget — should reach depth > 1
-        let result = find_best_move_timed(&board, 5000, &mut info_sink, &mut tt).unwrap();
+        let result = find_best_move_timed(&board, 5000, &mut info_sink, &mut tt, &EngineConfig::default()).unwrap();
         assert!(result.depth >= 2, "should reach at least depth 2, got {}", result.depth);
         assert!(info_sink.len() >= 2, "should have at least 2 info entries, got {}", info_sink.len());
         // Info entries should have increasing depth
@@ -1327,7 +1338,7 @@ mod tests {
         let mut info_sink = Vec::new();
         let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
         // Zero budget — depth 1 should still complete
-        let result = find_best_move_timed(&board, 0, &mut info_sink, &mut tt).unwrap();
+        let result = find_best_move_timed(&board, 0, &mut info_sink, &mut tt, &EngineConfig::default()).unwrap();
         assert_eq!(result.depth, 1, "depth 1 should complete even with 0 budget");
         assert!(!info_sink.is_empty(), "should have at least 1 info entry");
     }
@@ -1341,7 +1352,7 @@ mod tests {
                 .unwrap();
         let mut moves = generate_moves(&board);
         let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
-        order_moves(&board, &mut moves, &empty_history);
+        order_moves(&board, &mut moves, &empty_history, &EngineConfig::default());
 
         // First move should be a capture (Nc3xd5)
         if let Some(BughouseMove::Regular(cm)) = moves.first() {
@@ -1402,7 +1413,7 @@ mod tests {
                 .unwrap();
         let mut info_sink = Vec::new();
         let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
-        let result = find_best_move_timed(&board, 2000, &mut info_sink, &mut tt);
+        let result = find_best_move_timed(&board, 2000, &mut info_sink, &mut tt, &EngineConfig::default());
         assert!(result.is_some(), "should find a move without crashing");
         assert!(result.unwrap().depth >= 1, "should complete at least depth 1");
     }
@@ -1462,10 +1473,11 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let mut moves = generate_moves(&board);
         let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
-        order_moves(&board, &mut moves, &empty_history);
+        order_moves(&board, &mut moves, &empty_history, &EngineConfig::default());
         let _ = search_at_depth(&board, &moves, 4, &mut ctx1);
         let nodes1 = ctx1.nodes;
 
@@ -1479,6 +1491,7 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let _ = search_at_depth(&board, &moves, 4, &mut ctx2);
         let nodes2 = ctx2.nodes;
@@ -1530,6 +1543,7 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1563,6 +1577,7 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         // Black can capture a knight (+320cp) so quiescence should score
@@ -1593,6 +1608,7 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
         let static_eval = scoring::evaluate(&board);
@@ -1635,10 +1651,11 @@ mod tests {
             killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
             history: [[[0; 64]; 64]; 2],
             abort: None,
+            config: &EngineConfig::default(),
         };
         let mut moves = generate_moves(&board);
         let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
-        order_moves(&board, &mut moves, &empty_history);
+        order_moves(&board, &mut moves, &empty_history, &EngineConfig::default());
         let _ = search_at_depth(&board, &moves, 6, &mut ctx);
 
         // Without LMR, depth 6 from startpos would be ~500K-2M nodes.

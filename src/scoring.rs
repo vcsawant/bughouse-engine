@@ -13,6 +13,8 @@ use bughouse_chess::{
     get_knight_moves, get_rank, get_rook_moves,
 };
 
+use crate::config::EngineConfig;
+
 // ─── Piece Values (centipawns) ──────────────────────────────────────
 
 const PAWN_VALUE: i32 = 100;
@@ -196,8 +198,8 @@ fn pst_score(board: &Board, color: Color) -> i32 {
     score
 }
 
-/// King safety score for one color (negative = bad, penalty).
-fn king_safety(board: &Board, color: Color) -> i32 {
+/// King safety base penalty (without reserve amplifier).
+fn king_safety_base(board: &Board, color: Color) -> i32 {
     let king_sq = board.king_square(color);
     let king_file = king_sq.get_file();
     let king_rank = king_sq.get_rank();
@@ -252,13 +254,18 @@ fn king_safety(board: &Board, color: Color) -> i32 {
     let zone_under_attack = (king_zone & opp_attacks).popcnt() as i32;
     penalty -= 10 * zone_under_attack;
 
-    // (d) Reserve amplifier: scale penalty by opponent's reserve value
-    let opp_reserve_val = reserve_material_value(board, opponent);
-    if penalty < 0 {
-        penalty = penalty * (1000 + opp_reserve_val) / 1000;
-    }
-
     penalty
+}
+
+/// King safety score for one color (negative = bad, penalty).
+/// Uses default piece values for reserve amplifier.
+fn king_safety(board: &Board, color: Color) -> i32 {
+    let penalty = king_safety_base(board, color);
+    if penalty >= 0 { return penalty; }
+
+    // (d) Reserve amplifier: scale penalty by opponent's reserve value
+    let opp_reserve_val = reserve_material_value(board, !color);
+    penalty * (1000 + opp_reserve_val) / 1000
 }
 
 /// Mobility score for one color.
@@ -419,8 +426,76 @@ pub fn evaluate_detailed(board: &Board) -> EvalBreakdown {
 
 /// Evaluate a position, returning centipawns from the perspective of
 /// `board.side_to_move()`. Positive = good for the side to move.
+/// Uses default piece values and reserve multipliers.
 pub fn evaluate(board: &Board) -> i32 {
     evaluate_detailed(board).total
+}
+
+/// Evaluate a position using configurable piece values and reserve multipliers.
+/// Returns centipawns from the perspective of `board.side_to_move()`.
+pub fn evaluate_with_config(board: &Board, config: &EngineConfig) -> i32 {
+    match board.status() {
+        BoardStatus::Checkmate => return -30000,
+        BoardStatus::Stalemate => return 0,
+        BoardStatus::Ongoing => {}
+    }
+
+    let white = Color::White;
+    let black = Color::Black;
+
+    let mat = material_score_cfg(board, white, config) - material_score_cfg(board, black, config);
+    let res = reserve_score_cfg(board, white, config) - reserve_score_cfg(board, black, config);
+    let pst_val = pst_score(board, white) - pst_score(board, black);
+    let king = king_safety_cfg(board, white, config) - king_safety_cfg(board, black, config);
+    let mob = mobility_score(board, white) - mobility_score(board, black);
+    let pawns = pawn_structure(board, white) - pawn_structure(board, black);
+
+    let total = mat + res + pst_val + king + mob + pawns;
+
+    let sign = match board.side_to_move() {
+        Color::White => 1,
+        Color::Black => -1,
+    };
+    total * sign
+}
+
+/// Material count using config piece values.
+fn material_score_cfg(board: &Board, color: Color, config: &EngineConfig) -> i32 {
+    let mut score = 0;
+    for piece in ALL_PIECES {
+        if piece == Piece::King { continue; }
+        let count = (*board.pieces(piece) & *board.color_combined(color)).popcnt() as i32;
+        score += count * config.piece_value(piece);
+    }
+    score
+}
+
+/// Reserve score using config piece values and reserve multipliers.
+fn reserve_score_cfg(board: &Board, color: Color, config: &EngineConfig) -> i32 {
+    let reserve = &board.reserves()[color.to_index()];
+    let mut score = 0;
+    for (piece, count) in reserve.iter() {
+        score += count as i32 * config.piece_value(piece) * config.reserve_multiplier_pct(piece) / 100;
+    }
+    score
+}
+
+/// King safety using config piece values for reserve amplifier.
+fn king_safety_cfg(board: &Board, color: Color, config: &EngineConfig) -> i32 {
+    // Delegate to the main king_safety but use config for the reserve amplifier
+    // The reserve amplifier scales with opponent reserve material
+    let base = king_safety_base(board, color);
+    let opponent = !color;
+    let opp_reserve_value = {
+        let reserve = &board.reserves()[opponent.to_index()];
+        let mut value = 0;
+        for (piece, count) in reserve.iter() {
+            value += count as i32 * config.piece_value(piece);
+        }
+        value
+    };
+    let amplifier = 100 + opp_reserve_value / 5;
+    base * amplifier / 100
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ use log::{info, warn, debug};
 use std::time::Instant;
 
 use crate::book::OpeningBook;
+use crate::config::EngineConfig;
 use crate::engine::{self, EvalCommand, EvalHandle};
 use crate::search::{self, BoardEval, TTEntry, TT_DEFAULT, TT_DEFAULT_SIZE};
 use crate::strategy;
@@ -180,6 +181,8 @@ pub struct EngineState {
     book: OpeningBook,
     /// Parsed state from partner's messages.
     partner_state: PartnerState,
+    /// Tunable engine parameters.
+    pub config: EngineConfig,
 }
 
 impl EngineState {
@@ -194,6 +197,7 @@ impl EngineState {
             our_color: [None; 2],
             book: OpeningBook::new(),
             partner_state: PartnerState::default(),
+            config: EngineConfig::default(),
         }
     }
 
@@ -248,7 +252,20 @@ pub fn process_command(state: &mut EngineState, cmd: &UbiCommand) -> Vec<UbiResp
             vec![]
         }
 
-        UbiCommand::SetOption { .. } => vec![],
+        UbiCommand::SetOption { name, value } => {
+            if let Some(val) = value {
+                if state.config.apply_option(name, val) {
+                    info!("[game:{}] Option set: {} = {}", state.game_id, name, val);
+                    // Propagate config to eval threads
+                    for handle in &state.eval_handles {
+                        handle.send(EvalCommand::UpdateConfig(state.config.clone()));
+                    }
+                } else {
+                    debug!("[game:{}] Unknown or invalid option: {} = {}", state.game_id, name, val);
+                }
+            }
+            vec![]
+        }
 
         UbiCommand::Position { board_a, board_b, clocks } => {
             handle_position_board(state, BoardId::A, board_a);
@@ -370,7 +387,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
     let other_idx = 1 - go_idx;
     let side = board.side_to_move();
     let both_team_active = state.active_go[other_idx]; // other board already has active go
-    let mut play_style = strategy::determine_play_style(&state.clocks, board_id, side, both_team_active);
+    let mut play_style = strategy::determine_play_style(&state.clocks, board_id, side, both_team_active, &state.config);
 
     // Partner play_fast override: downgrade to Blitz if partner is in time trouble
     if state.partner_state.play_fast
@@ -381,7 +398,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
         play_style = strategy::PlayStyle::Blitz;
     }
 
-    let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side, play_style);
+    let budget_ms = crate::time::allocate_time(&state.clocks, board_id, side, play_style, &state.config);
 
     // Track active go and team colors
     state.active_go[go_idx] = true;
@@ -440,6 +457,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
                 &other_board,
                 other_eval_status.best_score,
                 2, // depth 2 for drop search — fast but meaningful with quiescence
+                &state.config,
             );
             debug!(
                 "[game:{}] Board {:?} reserve_impact (fast): [P:{} N:{} B:{} R:{} Q:{}]",
@@ -512,7 +530,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
                 debug!("[game:{}] Partner requested stall — minimizing cross-board weight", state.game_id);
                 0.1
             } else {
-                play_style.style_factor()
+                state.config.style_factor(play_style)
             };
             let weight = base_weight * style_factor;
 
@@ -561,7 +579,7 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
 
             // Aggressiveness threshold: only allow cross-board override if the
             // cross-board value exceeds the threshold for our PlayStyle.
-            let threshold = play_style.aggressiveness_threshold();
+            let threshold = state.config.aggressiveness_threshold(play_style);
             let best_local_move = scored_moves.iter().max_by_key(|m| m.1).map(|m| &m.0);
             let (adjusted_best_str, _, adjusted_best_cross, adjusted_best_score, _) = &scored_moves[0];
 
@@ -999,7 +1017,7 @@ mod tests {
         set_startpos(&mut state);
         // With 60s on clock, normally Standard. But partner play_fast → Blitz.
         state.clocks = [60000, 60000, 60000, 60000];
-        let style = strategy::determine_play_style(&state.clocks, BoardId::A, Color::White, false);
+        let style = strategy::determine_play_style(&state.clocks, BoardId::A, Color::White, false, &state.config);
         assert_eq!(style, strategy::PlayStyle::Standard);
         // The override happens in handle_go, not in determine_play_style
         assert!(state.partner_state.play_fast);

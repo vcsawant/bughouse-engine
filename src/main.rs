@@ -2,6 +2,7 @@ mod ubi;
 mod game_state;
 mod engine;
 mod book;
+mod config;
 mod strategy;
 mod scoring;
 mod search;

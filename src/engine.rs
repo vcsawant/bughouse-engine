@@ -15,6 +15,7 @@ use bughouse_chess::{
 };
 use log::{debug, info, warn};
 
+use crate::config::EngineConfig;
 use crate::scoring;
 use crate::search::{
     self, BoardEval, CaptureStats, RootMoveEvalPub, SearchInfo,
@@ -31,6 +32,8 @@ pub enum EvalCommand {
     Pause,
     /// Resume pondering after a pause.
     Resume,
+    /// Update engine configuration (piece values, strategy params, etc.)
+    UpdateConfig(EngineConfig),
     /// Shut down the eval thread.
     Quit,
 }
@@ -239,6 +242,7 @@ pub fn eval_thread_loop(
     let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
     let mut board: Option<Board> = None;
     let mut paused = true; // start paused until we get a position
+    let mut config = EngineConfig::default();
 
     // Mark as not searching initially
     {
@@ -281,6 +285,9 @@ pub fn eval_thread_loop(
                         }
                         EvalCommand::Pause => {
                             // Already paused, ignore
+                        }
+                        EvalCommand::UpdateConfig(cfg) => {
+                            config = cfg;
                         }
                     }
                 }
@@ -338,6 +345,9 @@ pub fn eval_thread_loop(
                         let mut status = shared.status.lock().unwrap();
                         status.searching = true;
                     }
+                    EvalCommand::UpdateConfig(cfg) => {
+                        config = cfg;
+                    }
                 }
             }
 
@@ -355,7 +365,7 @@ pub fn eval_thread_loop(
 
             // Search at this depth (abort flag allows mid-depth interruption)
             let search_result = search::search_at_depth_pub(
-                &b, &moves, depth, &mut tt, Some(&*abort_flag),
+                &b, &moves, depth, &mut tt, Some(&*abort_flag), &config,
             );
 
             if let Some((best_move, score, pv, root_evals, nodes)) = search_result {
@@ -448,6 +458,7 @@ pub fn compute_reserve_impact_fast(
     board: &Board,
     best_score: i32,
     search_depth: u32,
+    config: &EngineConfig,
 ) -> [i32; NUM_NON_KING_PIECES] {
     use bughouse_chess::MoveGen;
 
@@ -485,7 +496,7 @@ pub fn compute_reserve_impact_fast(
                 _ => None,
             } {
                 // Search from opponent's perspective, negate back
-                let score = -search::evaluate_position(&child, search_depth.saturating_sub(1), &mut tt);
+                let score = -search::evaluate_position(&child, search_depth.saturating_sub(1), &mut tt, config);
                 if score > best_drop_score {
                     best_drop_score = score;
                 }

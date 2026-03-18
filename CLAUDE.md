@@ -24,6 +24,7 @@ src/
 ├── game_state.rs    # EngineState, command dispatch, move selection (no I/O)
 ├── engine.rs        # Multi-threaded eval threads with pondering
 ├── book.rs          # Opening book: bughouse theory lines with weighted random selection
+├── config.rs        # EngineConfig: all tunable parameters, setoption handling
 ├── strategy.rs      # PlayStyle enum + time-aware style selection
 ├── scoring.rs       # Static evaluation function (material, PSTs, king safety, etc.)
 ├── search.rs        # Alpha-beta negamax with iterative deepening, P/C computation
