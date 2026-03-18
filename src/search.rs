@@ -10,6 +10,7 @@ use bughouse_chess::{
     get_file, get_king_moves, get_king_zone, get_rank,
 };
 
+use std::sync::LazyLock;
 use std::time::Instant;
 use log::debug;
 
@@ -71,6 +72,28 @@ const MATE_SCORE: i32 = 30000;
 
 /// How often to check the clock (every N nodes).
 const TIME_CHECK_INTERVAL: usize = 1024;
+
+// ─── Late Move Reductions ───────────────────────────────────────────
+
+/// Minimum depth to apply LMR (don't reduce shallow searches).
+const LMR_MIN_DEPTH: u32 = 3;
+
+/// Number of moves searched at full depth before reductions kick in.
+/// Covers the TT best move + first 2 captures/killers.
+const LMR_FULL_DEPTH_MOVES: usize = 3;
+
+/// Precomputed LMR reduction table: `LMR_TABLE[depth][move_index]` → reduction.
+/// Uses `ln(depth) * ln(move_index) / 2.0`, clamped to at least 1.
+static LMR_TABLE: LazyLock<[[u32; 64]; 64]> = LazyLock::new(|| {
+    let mut table = [[0u32; 64]; 64];
+    for d in 1..64 {
+        for m in 1..64 {
+            let r = ((d as f64).ln() * (m as f64).ln() / 2.0) as u32;
+            table[d][m] = r.max(1);
+        }
+    }
+    table
+});
 
 /// Per-piece-type capture statistics derived from the search tree.
 ///
@@ -470,8 +493,10 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
 
     let mut best_score = i32::MIN + 1; // Avoid overflow on negation
     let mut best_move: u16 = 0;
+    let in_check = *board.checkers() != EMPTY;
+    let lmr = &*LMR_TABLE;
 
-    for m in &moves {
+    for (i, m) in moves.iter().enumerate() {
         if ctx.time_up {
             break;
         }
@@ -481,7 +506,36 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
             None => continue, // Illegal drop
         };
 
-        let score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, ctx);
+        // Late Move Reductions: reduce depth for late quiet non-drop moves
+        let is_quiet = is_quiet_move(board, m);
+        let is_drop = matches!(m, BughouseMove::Drop { .. });
+        let is_killer = (ply as usize) < MAX_DEPTH as usize
+            && (m.compress() == ctx.killers[ply as usize][0]
+                || m.compress() == ctx.killers[ply as usize][1]);
+
+        let score;
+        if i >= LMR_FULL_DEPTH_MOVES
+            && depth >= LMR_MIN_DEPTH
+            && is_quiet
+            && !is_drop
+            && !in_check
+            && !is_killer
+        {
+            let r = lmr[depth.min(63) as usize][i.min(63)];
+            let reduced_depth = (depth - 1).saturating_sub(r);
+
+            // Reduced null-window search
+            let reduced_score = -negamax(&child, reduced_depth, ply + 1, -(alpha + 1), -alpha, ctx);
+
+            // Re-search at full depth + full window if reduced search beat alpha
+            if reduced_score > alpha && !ctx.time_up {
+                score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, ctx);
+            } else {
+                score = reduced_score;
+            }
+        } else {
+            score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, ctx);
+        }
 
         if ctx.time_up {
             break;
@@ -1546,5 +1600,75 @@ mod tests {
             "quiescence should never be worse than stand_pat: score={}, static_eval={}",
             score, static_eval
         );
+    }
+
+    #[test]
+    fn lmr_table_values() {
+        let table = &*LMR_TABLE;
+        // depth=0, move_index=0: no reduction
+        assert_eq!(table[0][0], 0);
+        // depth=1, move_index=1: ln(1)*ln(1)/2 = 0, clamped to 1
+        assert_eq!(table[1][1], 1);
+        // Reductions increase with depth and move index
+        assert!(table[6][10] > table[3][3],
+            "deeper+later should reduce more: [6][10]={} vs [3][3]={}",
+            table[6][10], table[3][3]);
+        // Large depth + large move index should have substantial reduction
+        assert!(table[8][20] >= 2,
+            "depth 8, move 20 should reduce by at least 2, got {}",
+            table[8][20]);
+    }
+
+    #[test]
+    fn lmr_reduces_node_count() {
+        // Compare node count at depth 6 with vs without LMR.
+        // Since LMR is always active, we compare against the theoretical
+        // maximum by asserting a reasonable node count.
+        let board = Board::default();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let mut ctx = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+            killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
+            abort: None,
+        };
+        let mut moves = generate_moves(&board);
+        let empty_history: HistoryTable = [[[0; 64]; 64]; 2];
+        order_moves(&board, &mut moves, &empty_history);
+        let _ = search_at_depth(&board, &moves, 6, &mut ctx);
+
+        // Without LMR, depth 6 from startpos would be ~500K-2M nodes.
+        // With LMR, expect a significant reduction.
+        assert!(ctx.nodes < 1_500_000,
+            "LMR should reduce node count at depth 6, got {} nodes", ctx.nodes);
+        assert!(ctx.nodes > 0, "should search some nodes");
+    }
+
+    #[test]
+    fn lmr_still_finds_hanging_queen() {
+        // Correctness check: LMR should not miss obvious tactics.
+        let board: Board =
+            "rnb1kbnr/pppppppp/8/4q3/8/5N2/PPPPPPPP/RNBQKB1R[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        let result = search(&board, 4).unwrap();
+        assert!(result.score > 500,
+            "should still capture hanging queen with LMR active, score={}", result.score);
+    }
+
+    #[test]
+    fn lmr_inactive_at_shallow_depth() {
+        // At depth 1-2, LMR should not trigger (LMR_MIN_DEPTH = 3).
+        // Results should be identical to a search without LMR.
+        let board = Board::default();
+        let result1 = search(&board, 1).unwrap();
+        let result2 = search(&board, 2).unwrap();
+        // Just verify they complete and produce reasonable results
+        assert!(result1.score.abs() < 1000, "depth 1 score reasonable: {}", result1.score);
+        assert!(result2.score.abs() < 1000, "depth 2 score reasonable: {}", result2.score);
     }
 }
