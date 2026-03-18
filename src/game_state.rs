@@ -9,6 +9,7 @@ use log::{info, warn, debug};
 use rand::seq::SliceRandom;
 use std::time::Instant;
 
+use crate::book::OpeningBook;
 use crate::engine::{self, EvalCommand, EvalHandle};
 use crate::search::{self, BoardEval, TTEntry, TT_DEFAULT, TT_DEFAULT_SIZE};
 use crate::strategy;
@@ -27,6 +28,7 @@ pub struct EngineState {
     /// Which color is "our team" on each board. Set on first `go` using
     /// bughouse pairing rule (white on A = black on B).
     our_color: [Option<Color>; 2],
+    book: OpeningBook,
 }
 
 impl EngineState {
@@ -39,6 +41,7 @@ impl EngineState {
             eval_handles: [engine::spawn_eval_thread(), engine::spawn_eval_thread()],
             active_go: [false; 2],
             our_color: [None; 2],
+            book: OpeningBook::new(),
         }
     }
 
@@ -235,6 +238,21 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
         "[game:{}] Board {:?} go: our_time={}ms opp_time={}ms budget={}ms style={:?}",
         state.game_id, board_id, our_time, opp_time, budget_ms, _play_style
     );
+
+    // Opening book check — instant response if position is in book
+    if let Some(book_move) = state.book.lookup(&board, &mut state.rng) {
+        let move_str = format_move(&book_move);
+        info!("[game:{}] Board {:?}: BOOK HIT — playing {} instantly",
+            state.game_id, board_id, move_str);
+        state.active_go[go_idx] = false;
+        return vec![
+            UbiResponse::Info {
+                board: board_id, depth: 0, nodes: 0, time_ms: 0,
+                score_cp: 0, pv: vec![move_str.clone()],
+            },
+            UbiResponse::BestMove { board: board_id, move_str },
+        ];
+    }
 
     // Wait for the eval thread to search within our time budget.
     // The eval thread started when the position command arrived.
@@ -495,10 +513,9 @@ mod tests {
         let mut state = new_state();
         set_startpos(&mut state);
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        // TeamMsg + at least 1 Info line + BestMove
-        assert!(resp.len() >= 3, "expected at least 3 responses, got {}", resp.len());
-        assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
-        assert!(matches!(&resp[1], UbiResponse::Info { board: BoardId::A, .. }));
+        // Book hit: Info + BestMove (2 responses)
+        // Normal: TeamMsg + Info lines + BestMove (3+ responses)
+        assert!(resp.len() >= 2, "expected at least 2 responses, got {}", resp.len());
         assert!(matches!(&resp[resp.len() - 1], UbiResponse::BestMove { board: BoardId::A, .. }));
     }
 
@@ -531,10 +548,12 @@ mod tests {
 
     #[test]
     fn go_includes_drops() {
+        // Use a midgame position with reserves that is NOT in the opening book.
+        // This position has pieces developed beyond any book line.
         let mut state = new_state();
         process_command(&mut state, &UbiCommand::Position {
             board_a: PositionSpec::Bfen(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQkq - 0 1".to_string()
+                "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQ1RK1[N] b kq - 5 4".to_string()
             ),
             board_b: PositionSpec::StartPos,
             clocks: [180000, 180000, 180000, 180000],
@@ -594,13 +613,11 @@ mod tests {
         set_startpos(&mut state);
 
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::A });
-        assert!(resp.len() >= 3);
-        assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
+        assert!(resp.len() >= 2, "expected at least 2 responses for board A, got {}", resp.len());
         assert!(matches!(&resp[resp.len() - 1], UbiResponse::BestMove { board: BoardId::A, .. }));
 
         let resp = process_command(&mut state, &UbiCommand::Go { board: BoardId::B });
-        assert!(resp.len() >= 3);
-        assert!(matches!(&resp[0], UbiResponse::TeamMsg(_)));
+        assert!(resp.len() >= 2, "expected at least 2 responses for board B, got {}", resp.len());
         assert!(matches!(&resp[resp.len() - 1], UbiResponse::BestMove { board: BoardId::B, .. }));
 
         let resp = process_command(&mut state, &UbiCommand::Quit);

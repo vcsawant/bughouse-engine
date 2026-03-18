@@ -22,6 +22,8 @@ src/
 ├── main.rs          # Thin I/O loop only. No logic here.
 ├── ubi.rs           # UBI protocol parsing & formatting (pure data, no I/O)
 ├── game_state.rs    # EngineState, command dispatch, move selection (no I/O)
+├── engine.rs        # Multi-threaded eval threads with pondering
+├── book.rs          # Opening book: bughouse theory lines with weighted random selection
 ├── strategy.rs      # PlayStyle enum + time-aware style selection
 ├── scoring.rs       # Static evaluation function (material, PSTs, king safety, etc.)
 ├── search.rs        # Alpha-beta negamax with iterative deepening, P/C computation

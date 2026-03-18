@@ -58,7 +58,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (113 unit tests covering protocol, state, evaluation, search, TT, quiescence, time, pondering)
+# Test (124 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, opening book, time, pondering)
 cargo test
 ```
 
@@ -110,6 +110,7 @@ src/
 ├── ubi.rs           # UBI protocol parser & formatter (pure data, no I/O)
 ├── game_state.rs    # EngineState + command dispatch → responses (no I/O)
 ├── engine.rs        # Multi-threaded eval threads with pondering, EvalCommand/EvalStatus
+├── book.rs          # Opening book: bughouse theory lines with weighted random selection
 ├── strategy.rs      # PlayStyle enum + time-aware style selection (stub for Phase C)
 ├── scoring.rs       # Static evaluation: material, reserves, PSTs, king safety, mobility, pawns
 ├── search.rs        # Alpha-beta negamax with iterative deepening, drop pruning, P/C computation
@@ -193,11 +194,13 @@ Multi-ply search with alpha-beta pruning and iterative deepening. Each board's e
   - `Instant` (< 1s), `Blitz` (< 10s), `Extended` (> 30s with 2x advantage), `Standard` (default)
 
 **Deferred to future optimization:**
-- Killer moves and history heuristic for move ordering
 - Continuous background evaluation (pondering) with subtree reuse
 - Delta pruning in quiescence search
 
 **Recently implemented:**
+- Opening book: hardcoded bughouse opening theory (~40 entries) covering the first 3-4 moves for both colors. Includes the Mongolian Attack (e4/d4/Bc4/Be3), Nh3→Ng5 f7-attack system, Italian setup, and fortress defense (e6/d6). Book positions are matched by position hash (excluding reserves) with weighted random selection for variety. Book hits return instantly, saving clock time for the middlegame.
+- Late move reductions (LMR): after the first few moves are searched at full depth, later quiet moves are searched at reduced depth. If the reduced search returns a surprisingly good score, a full-depth re-search is triggered. Uses a precomputed logarithmic reduction table (`ln(depth) * ln(move_index) / 2`). Drops are never reduced (bughouse-specific — drops are high-impact tactical moves). Typically adds 1-2 effective plies of search depth for the same time budget.
+- Killer moves and history heuristic for move ordering: quiet moves that cause beta cutoffs are tracked per-ply (2 killer slots) and promoted in move ordering. History heuristic tracks `[color][from][to]` cutoff frequency with depth²-scaled bonuses.
 - Quiescence search: at the search horizon, continues searching capture-only moves until the position is stable. Eliminates tactical blind spots (horizon effect) where the engine would miss recaptures or hanging pieces. Uses `MoveGen::capture_moves()` from the library for efficient capture generation.
 - Transposition table (hash-based position caching with Zobrist keys, 8 MB default, configurable via `setoption name Hash value <MB>`). TT best-move ordering, mate score adjustment, and always-replace policy. Shared across both boards.
 
