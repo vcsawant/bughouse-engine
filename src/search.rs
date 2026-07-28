@@ -295,6 +295,111 @@ fn generate_checking_drops(board: &Board) -> Vec<BughouseMove> {
     moves
 }
 
+// ─── Static Exchange Evaluation ──────────────────────────────────────
+
+/// Piece value for SEE. Kings are effectively infinite so the swap algorithm
+/// never lets a king capture into remaining enemy attackers.
+fn see_value(piece: Piece, config: &EngineConfig) -> i32 {
+    match piece {
+        Piece::King => 20000,
+        p => config.piece_value(p),
+    }
+}
+
+/// Find the least valuable attacker of `sq` for `color`, considering only
+/// pieces still present in `occupied` (removed pieces expose x-ray attackers
+/// because slider attacks are recomputed against the shrinking occupancy).
+fn least_valuable_attacker(
+    board: &Board,
+    sq: bughouse_chess::Square,
+    color: Color,
+    occupied: BitBoard,
+) -> Option<(Piece, bughouse_chess::Square)> {
+    let ours = *board.color_combined(color) & occupied;
+
+    let pawns = get_pawn_attack_squares(sq, !color) & *board.pieces(Piece::Pawn) & ours;
+    if pawns != EMPTY {
+        return Some((Piece::Pawn, pawns.to_square()));
+    }
+    let knights = get_knight_moves(sq) & *board.pieces(Piece::Knight) & ours;
+    if knights != EMPTY {
+        return Some((Piece::Knight, knights.to_square()));
+    }
+    let diag = get_bishop_moves(sq, occupied);
+    let bishops = diag & *board.pieces(Piece::Bishop) & ours;
+    if bishops != EMPTY {
+        return Some((Piece::Bishop, bishops.to_square()));
+    }
+    let straight = get_rook_moves(sq, occupied);
+    let rooks = straight & *board.pieces(Piece::Rook) & ours;
+    if rooks != EMPTY {
+        return Some((Piece::Rook, rooks.to_square()));
+    }
+    let queens = (diag | straight) & *board.pieces(Piece::Queen) & ours;
+    if queens != EMPTY {
+        return Some((Piece::Queen, queens.to_square()));
+    }
+    let kings = get_king_moves(sq) & *board.pieces(Piece::King) & ours;
+    if kings != EMPTY {
+        return Some((Piece::King, kings.to_square()));
+    }
+    None
+}
+
+/// Static exchange evaluation of a capture: the material outcome of the full
+/// capture-recapture sequence on the destination square, assuming both sides
+/// capture with their least valuable attacker and may stop when ahead.
+/// Positive = winning or equal exchange for the side to move.
+///
+/// Approximations: en passant scores the victim as 0 (destination square is
+/// empty), and capture-promotions value the attacker as a pawn. Both err
+/// conservative and are rare.
+fn see(board: &Board, cm: &bughouse_chess::ChessMove, config: &EngineConfig) -> i32 {
+    let dest = cm.get_dest();
+    let source = cm.get_source();
+
+    let attacker = match board.piece_on(source) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut gain = [0i32; 32];
+    gain[0] = board.piece_on(dest).map(|p| see_value(p, config)).unwrap_or(0);
+
+    let mut occupied = *board.combined() ^ BitBoard::from_square(source);
+    let mut side = !board.side_to_move();
+    let mut attacker_value = see_value(attacker, config);
+    let mut d = 0;
+
+    loop {
+        // Find `side`'s cheapest recapturer BEFORE committing a gain level —
+        // if none exists, the piece on dest stands and the swap ends here.
+        let (lva_piece, lva_sq) = match least_valuable_attacker(board, dest, side, occupied) {
+            Some(x) => x,
+            None => break,
+        };
+        d += 1;
+        if d >= 32 {
+            break;
+        }
+        // `side` captures the piece currently on dest (worth attacker_value)
+        gain[d] = attacker_value - gain[d - 1];
+        // Neither continuation can improve either side — exchange is settled
+        if (-gain[d - 1]).max(gain[d]) < 0 {
+            break;
+        }
+        occupied ^= BitBoard::from_square(lva_sq);
+        attacker_value = see_value(lva_piece, config);
+        side = !side;
+    }
+
+    // Negamax the swap list backwards: each side may decline to continue
+    while d > 0 {
+        gain[d - 1] = -(-gain[d - 1]).max(gain[d]);
+        d -= 1;
+    }
+    gain[0]
+}
+
 // ─── Move Ordering ───────────────────────────────────────────────────
 
 /// Score a move for ordering purposes (higher = searched first).
@@ -451,7 +556,11 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
             alpha = stand_pat;
         }
 
+        // SEE pruning: skip captures that lose material in the exchange —
+        // searching them almost never raises alpha, and sacrificial attacks
+        // are the main search's job (check evasions below are never pruned).
         moves = MoveGen::capture_moves(board)
+            .filter(|cm| see(board, cm, ctx.config) >= 0)
             .map(BughouseMove::Regular)
             .collect();
 
@@ -1499,6 +1608,85 @@ mod tests {
         } else {
             panic!("first ordered move should be a regular capture");
         }
+    }
+
+    /// Helper: find the regular capture from `from` to `to` and run SEE on it.
+    fn see_for(board: &Board, from: &str, to: &str) -> i32 {
+        let mv: BughouseMove = format!("{}{}", from, to).parse().unwrap();
+        let cm = match mv {
+            BughouseMove::Regular(cm) => cm,
+            _ => panic!("expected regular move"),
+        };
+        see(board, &cm, &EngineConfig::default())
+    }
+
+    #[test]
+    fn see_hanging_piece_wins_full_value() {
+        // Nf3xe5 takes an undefended queen: +900
+        let board: Board =
+            "rnb1kbnr/pppppppp/8/4q3/8/5N2/PPPPPPPP/RNBQKB1R[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        assert_eq!(see_for(&board, "f3", "e5"), 900);
+    }
+
+    #[test]
+    fn see_losing_capture_negative() {
+        // Qd3xd5 takes a pawn defended by the c6 pawn: 100 - 900 = -800
+        let board: Board =
+            "rnbqkbnr/pp1ppppp/2p5/3p4/8/3Q4/PPP1PPPP/RNB1KBNR[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        assert_eq!(see_for(&board, "d3", "d5"), -800);
+    }
+
+    #[test]
+    fn see_equal_trade_zero() {
+        // e4xd5 pawn takes pawn, c6 pawn recaptures: 100 - 100 = 0
+        let board: Board =
+            "rnbqkbnr/pp1ppppp/2p5/3p4/4P3/8/PPPP1PPP/RNBQKBNR[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        assert_eq!(see_for(&board, "e4", "d5"), 0);
+    }
+
+    #[test]
+    fn see_xray_battery() {
+        // Rd2xd5 takes a pawn defended by the d8 rook, but the d1 rook backs
+        // up the capture (x-ray through d2): win the pawn, trade rooks = +100.
+        // Without x-ray awareness this looks like -400.
+        let board: Board =
+            "3r3k/8/8/3p4/8/8/3R4/3R3K[] w - - 0 1"
+                .parse()
+                .unwrap();
+        assert_eq!(see_for(&board, "d2", "d5"), 100);
+    }
+
+    #[test]
+    fn qsearch_prunes_losing_captures() {
+        // White's only captures are Qxd5 and Qxh7, both losing the queen to a
+        // defended piece. SEE pruning should make quiescence return stand-pat
+        // after a single node instead of exploring the sacrifices.
+        let board: Board =
+            "rnbqkbnr/pp1ppppp/2p5/3p4/8/3Q4/PPP1PPPP/RNB1KBNR[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let mut ctx = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+            killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
+            abort: None,
+            config: &EngineConfig::default(),
+        };
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx, 1);
+        let static_eval = scoring::evaluate(&board);
+        assert_eq!(score, static_eval, "losing captures pruned → stand-pat");
+        assert_eq!(ctx.nodes, 1, "should not search pruned captures, got {} nodes", ctx.nodes);
     }
 
     #[test]
