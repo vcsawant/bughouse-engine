@@ -1,4 +1,4 @@
-# BFEN (Bughouse FEN) Specification v0.1
+# BFEN (Bughouse FEN) Specification v2.0
 
 ## Overview
 
@@ -7,6 +7,38 @@ BFEN (Bughouse FEN) extends the standard FEN (Forsyth-Edwards Notation) format t
 **Key additions to standard FEN:**
 - Piece reserves (captured pieces available for dropping)
 - Promoted piece tracking (for proper demotion on recapture)
+
+---
+
+## Relationship to BPGN BFEN
+
+BFEN builds on the original **BPGN BFEN** notation (circa 2002), which was the first standardized bughouse position format. BPGN BFEN appended reserves as a pseudo-9th rank using slash notation (`position/reserves`), making reserves syntactically identical to another rank in the FEN string.
+
+BFEN 2.0 modernizes this approach with **bracket notation** (`position[reserves]`), aligning with [fairy-stockfish](https://fairy-stockfish.github.io/) and the crazyhouse community. This eliminates the parsing ambiguity inherent in slash-based reserves while preserving the same information.
+
+### Comparison
+
+| Feature | BPGN BFEN (legacy) | BFEN 2.0 |
+|---------|-------------------|----------|
+| Reserves | Slash `/reserves` (pseudo-9th rank) | Brackets `[reserves]` |
+| Two-board | `board_a \| board_b` | `board_a \| board_b` (adopted) |
+| Promoted pieces | `~` suffix (inconsistent usage) | `~` suffix (always tracked) |
+| Standard alignment | Custom | fairy-stockfish compliant |
+| Parsing | Ambiguous (is last rank reserves or position?) | Unambiguous (brackets delimit reserves) |
+
+### Example
+
+The same position in both formats:
+
+**BPGN BFEN (legacy):**
+```
+r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R/NNPp w KQkq - 4 5
+```
+
+**BFEN 2.0:**
+```
+r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[NNPp] w KQkq - 4 5
+```
 
 ---
 
@@ -69,6 +101,153 @@ When a promoted piece is captured, it **demotes to a pawn** before going to the 
 
 ### Why Track Promotions?
 Bughouse rules require captured promoted pieces to revert to pawns. Without tracking, game integrity is violated.
+
+---
+
+## Two-Board Representation
+
+Bughouse involves two simultaneous games. BFEN 2.0 defines a standard way to represent both boards in a single string.
+
+### Format
+
+```
+<bfen_board_a> | <bfen_board_b>
+```
+
+- Pipe `|` separator with optional surrounding whitespace
+- Board A always listed first
+- Each side is independently a valid single-board BFEN string
+- Consistent with BPGN two-board convention
+
+### Two-Board Examples
+
+**Starting position (both boards):**
+```
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1 | rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1
+```
+
+**Mid-game with reserves:**
+```
+r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[NNPp] w KQkq - 4 5 | rnbqkb1r/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR[Qbpp] b KQkq - 0 3
+```
+
+**With promoted pieces:**
+```
+r2q1rk1/ppp2ppp/2n1bn2/3p4/3P4/2NB~/5N2/R1BQ1RK1[QNNPrbp] b - - 0 12 | r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/5N2/PPPP1PPP/RNBQK2R[Pp] w KQkq - 2 4
+```
+
+### Parsing Two-Board BFEN
+
+Split on ` | ` (pipe with surrounding spaces) to get two independent single-board BFEN strings. Each half can be parsed using the standard single-board parser.
+
+**Important:** The pipe separator appears between two complete BFEN strings (each containing spaces for their own fields), so split on ` | ` rather than just `|` to avoid ambiguity.
+
+---
+
+## BPGN BFEN Conversion
+
+For interoperability with legacy BPGN tools, here are conversion functions between slash-based (BPGN) and bracket-based (BFEN 2.0) reserve notation.
+
+### Conversion Logic
+
+```
+BPGN:  position/reserves color castling ep half full
+BFEN:  position[reserves] color castling ep half full
+```
+
+The slash-based reserves are the "9th rank" — the last segment of the position field (after splitting on `/`) before the space-separated metadata.
+
+### Python
+
+```python
+def bpgn_to_bfen(bpgn_str):
+    """Convert BPGN BFEN (slash reserves) to BFEN 2.0 (bracket reserves)."""
+    parts = bpgn_str.split(' ')
+    position_with_reserves = parts[0]
+    metadata = parts[1:]  # color, castling, ep, half, full
+
+    # Split position ranks — the 9th "rank" is reserves
+    ranks = position_with_reserves.split('/')
+    if len(ranks) == 9:
+        position = '/'.join(ranks[:8])
+        reserves = ranks[8]
+    else:
+        position = '/'.join(ranks)
+        reserves = ''
+
+    return f"{position}[{reserves}] {' '.join(metadata)}"
+
+
+def bfen_to_bpgn(bfen_str):
+    """Convert BFEN 2.0 (bracket reserves) to BPGN BFEN (slash reserves)."""
+    bracket_start = bfen_str.index('[')
+    bracket_end = bfen_str.index(']')
+
+    position = bfen_str[:bracket_start]
+    reserves = bfen_str[bracket_start + 1:bracket_end]
+    metadata = bfen_str[bracket_end + 1:].strip()
+
+    return f"{position}/{reserves} {metadata}"
+```
+
+### JavaScript
+
+```javascript
+function bpgnToBfen(bpgnStr) {
+    const parts = bpgnStr.split(' ');
+    const ranks = parts[0].split('/');
+    const metadata = parts.slice(1).join(' ');
+
+    let position, reserves;
+    if (ranks.length === 9) {
+        position = ranks.slice(0, 8).join('/');
+        reserves = ranks[8];
+    } else {
+        position = ranks.join('/');
+        reserves = '';
+    }
+
+    return `${position}[${reserves}] ${metadata}`;
+}
+
+function bfenToBpgn(bfenStr) {
+    const bracketStart = bfenStr.indexOf('[');
+    const bracketEnd = bfenStr.indexOf(']');
+
+    const position = bfenStr.substring(0, bracketStart);
+    const reserves = bfenStr.substring(bracketStart + 1, bracketEnd);
+    const metadata = bfenStr.substring(bracketEnd + 1).trim();
+
+    return `${position}/${reserves} ${metadata}`;
+}
+```
+
+### Elixir
+
+```elixir
+defmodule BFENConvert do
+  def bpgn_to_bfen(bpgn_str) do
+    [position_with_reserves | metadata] = String.split(bpgn_str, " ", parts: 2)
+    ranks = String.split(position_with_reserves, "/")
+
+    {position, reserves} =
+      if length(ranks) == 9 do
+        {Enum.take(ranks, 8) |> Enum.join("/"), List.last(ranks)}
+      else
+        {Enum.join(ranks, "/"), ""}
+      end
+
+    "#{position}[#{reserves}] #{metadata}"
+  end
+
+  def bfen_to_bpgn(bfen_str) do
+    [before_bracket, rest] = String.split(bfen_str, "[", parts: 2)
+    [reserves, after_bracket] = String.split(rest, "]", parts: 2)
+
+    "#{before_bracket}/#{reserves} #{String.trim(after_bracket)}"
+  end
+end
+```
 
 ---
 
@@ -333,7 +512,6 @@ Q~Q~Q~/Q~Q~Q~/Q~Q~Q~/8/8/q~q~q~/q~q~q~/q~q~q~[] w - - 0 100
 ## Future Considerations
 
 - **Time metadata:** Currently separate from BFEN (by design)
-- **Board linkage:** Mechanism to represent both boards in single notation
 - **Move history:** Integration with PGN-style notation
 - **Variant rules:** Extensions for different bughouse rule sets
 
@@ -344,9 +522,15 @@ Q~Q~Q~/Q~Q~Q~/Q~Q~Q~/8/8/q~q~q~/q~q~q~/q~q~q~[] w - - 0 100
 - [Fairy-Stockfish Chess Variant Standards](https://fairy-stockfish.github.io/chess-variant-standards/fen.html)
 - [Standard FEN Specification](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation)
 - [Bughouse Chess Rules](https://en.wikipedia.org/wiki/Bughouse_chess)
+- [BPGN Specification](http://bughousedb.com/Lieven_BPGN_Standard.txt)
+- [Bughouse Database](http://bughousedb.com/)
 
 ---
 
 ## Version History
 
+- **v2.0** (2025-02-21) - Modernized specification
+  - Two-board representation with pipe separator
+  - BPGN BFEN compatibility section with conversion examples
+  - Acknowledged heritage from BPGN BFEN (circa 2002)
 - **v0.1** (2025-02-04) - Initial specification

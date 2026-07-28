@@ -31,13 +31,14 @@ A line-based stdin/stdout protocol (inspired by UCI) that supports dual-board bu
 | Direction | Command | Description |
 |-----------|---------|-------------|
 | stdin  | `ubi`                          | Handshake — engine must reply `ubiok` |
-| stdin  | `position board <A\|B> bfen <string>` | Set board state |
+| stdin  | `position <bfen_a> \| <bfen_b> clock <wA> <bA> <wB> <bB>` | Atomic full-state update: both boards + all four clocks |
 | stdin  | `go board <A\|B>`              | Start searching; reply with `bestmove` |
-| stdin  | `clock <side>_<board> <ms> ...` | Update clock values |
-| stdin  | `stop`                         | Abort search immediately |
-| stdin  | `teammsg <text>`               | Message from partner engine |
+| stdin  | `stop [board <A\|B>]`          | Cancel search (no `bestmove` follows) |
+| stdin  | `partnermsg <text>`            | Message from partner engine |
+| stdin  | `metadata <key> <value>`       | Match metadata (logging only) |
+| stdout | `info board <A\|B> ...`        | Search progress per depth |
 | stdout | `bestmove board <A\|B> <move>` | Engine's chosen move |
-| stdout | `partnermsg <text>`            | Message to partner engine |
+| stdout | `teammsg <text>`               | Message to partner engine |
 
 Drop moves use `@` notation: `p@e4` places a pawn on e4.
 
@@ -58,36 +59,32 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (152 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, opening book, strategy, time, teammsg, config, pondering)
+# Test (157 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, frozen positions, opening book, strategy, time, teammsg, config, pondering)
 cargo test
 ```
 
 The engine binary communicates over **stdin/stdout** only. It is not a server — it is spawned as a child process by a GUI or game server. To test it manually you can pipe commands into it:
 
 ```bash
-echo -e "ubi\nisready\nubinewgame\nposition board A startpos\ngo board A\nquit" \
+echo -e "ubi\nisready\nubinewgame\nposition startpos | startpos clock 180000 180000 180000 180000\ngo board A\nquit" \
   | ./target/debug/bughouse_engine
 ```
 
-Example output:
+Example output (instant reply — the starting position is an opening book hit):
 
 ```
 id name BughouseEngine 0.1.0
 id author Viren Sawant
 ubiok
 readyok
-teammsg need p
-info board A depth 1 nodes 20 time 0 score cp 66 pv b1c3
-info board A depth 2 nodes 391 time 4 score cp 0 pv b1c3
-info board A depth 3 nodes 6901 time 68 score cp 66 pv b1c3
-info board A depth 4 nodes 94708 time 825 score cp 0 pv b1c3
-bestmove board A b1c3
+info board A depth 0 nodes 0 time 0 score cp 0 pv e2e4
+bestmove board A e2e4
 ```
 
-With reserves (drops available):
+With reserves (drops available — white holds a knight and finds the forking drop):
 
 ```bash
-echo -e "ubi\nubinewgame\nposition board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[QNPqp] w KQkq - 0 1\ngo board A\nquit" \
+echo -e "ubi\nubinewgame\nposition 2q3k1/5ppp/8/8/8/8/5PPP/6K1[N] w - - 0 1 | startpos clock 180000 180000 180000 180000\ngo board A\nquit" \
   | ./target/debug/bughouse_engine
 ```
 
@@ -95,9 +92,12 @@ echo -e "ubi\nubinewgame\nposition board A bfen rnbqkbnr/pppppppp/8/8/8/8/PPPPPP
 id name BughouseEngine 0.1.0
 id author Viren Sawant
 ubiok
-teammsg threat critical
-info board A depth 1 nodes 80 time 1 score cp 617 pv q@e6
-bestmove board A q@e6
+teammsg material +400
+info board A depth 1 nodes 38 time 0 score cp -454 pv g1h1
+info board A depth 2 nodes 86 time 1 score cp 296 pv n@e7
+...
+info board A depth 11 nodes 51929 time 1227 score cp 447 pv n@e7
+bestmove board A n@e7
 ```
 
 ---
@@ -201,8 +201,9 @@ Multi-ply search with alpha-beta pruning and iterative deepening. Each board's e
 - Opening book: hardcoded bughouse opening theory (~40 entries) covering the first 3-4 moves for both colors. Includes the Mongolian Attack (e4/d4/Bc4/Be3), Nh3→Ng5 f7-attack system, Italian setup, and fortress defense (e6/d6). Book positions are matched by position hash (excluding reserves) with weighted random selection for variety. Book hits return instantly, saving clock time for the middlegame.
 - Late move reductions (LMR): after the first few moves are searched at full depth, later quiet moves are searched at reduced depth. If the reduced search returns a surprisingly good score, a full-depth re-search is triggered. Uses a precomputed logarithmic reduction table (`ln(depth) * ln(move_index) / 2`). Drops are never reduced (bughouse-specific — drops are high-impact tactical moves). Typically adds 1-2 effective plies of search depth for the same time budget.
 - Killer moves and history heuristic for move ordering: quiet moves that cause beta cutoffs are tracked per-ply (2 killer slots) and promoted in move ordering. History heuristic tracks `[color][from][to]` cutoff frequency with depth²-scaled bonuses.
-- Quiescence search: at the search horizon, continues searching capture-only moves until the position is stable. Eliminates tactical blind spots (horizon effect) where the engine would miss recaptures or hanging pieces. Uses `MoveGen::capture_moves()` from the library for efficient capture generation.
+- Quiescence search: at the search horizon, continues searching captures — plus **checking drops** near the horizon — until the position is stable. Checking drops are generated by attack symmetry (piece attacks computed from the enemy king square, intersected with empty squares), so drop-check tactics like freezes are visible one ply beyond the nominal depth. While in check, quiescence searches every evasion instead of standing pat, so forcing sequences are scored soundly. The drop-check window is tunable via `setoption name QsCheckDropDepth` (0 disables, default 1); measured cost is roughly 2-3× more quiescence nodes, a benchmarkable trade-off.
 - Transposition table (hash-based position caching with Zobrist keys, 8 MB default, configurable via `setoption name Hash value <MB>`). TT best-move ordering, mate score adjustment, and always-replace policy. Shared across both boards.
+- Frozen-position ("forced sit") detection: a side in check with no legal moves whose check is drop-blockable is not checkmated under bughouse rules — it must sit and wait for its partner to supply a blocking piece. The search scores this just below the mate band (`FROZEN_SCORE = 28000`, ply-adjusted), in both negamax and quiescence, so the engine actively hunts checks that can only be blocked by a piece the opponent doesn't have. Distinct from `MATE_SCORE = 30000` so logs distinguish "mated" from "frozen".
 
 ### Phase E — Cross-board strategy layer (in progress)
 
@@ -239,13 +240,14 @@ The engine understands it's playing bughouse, not just two independent chess gam
 
 **Tunable parameters via `setoption`:**
 
-All strategy, time, and evaluation parameters are configurable at runtime via UBI `setoption` commands. 28 parameters across three categories:
+All strategy, time, evaluation, and search parameters are configurable at runtime via UBI `setoption` commands. 29 parameters across four categories:
 
 | Category | Examples |
 |----------|---------|
 | Strategy thresholds | `InstantTime`, `BlitzTime`, `ExtendedAdvantage`, style factors, aggression thresholds |
 | Time budget | `BlitzDivisor`, `StandardCap`, `ExtendedDivisor` |
 | Piece values & reserves | `PawnValue`, `KnightValue`, `KnightReservePct` |
+| Search | `QsCheckDropDepth` (checking drops in quiescence: 0 = off, default 1) |
 
 Example: `setoption name BlitzStyleFactor value 0.7`
 
