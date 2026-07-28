@@ -7,7 +7,8 @@
 use bughouse_chess::{
     BitBoard, Board, BoardStatus, BughouseMove, CacheTable, Color, File,
     MoveGen, Piece, Rank, EMPTY, NON_KING_PIECES, NUM_NON_KING_PIECES,
-    get_file, get_king_moves, get_king_zone, get_rank,
+    get_bishop_moves, get_file, get_king_moves, get_king_zone, get_knight_moves,
+    get_pawn_attack_squares, get_rank, get_rook_moves,
 };
 
 use std::sync::LazyLock;
@@ -41,24 +42,24 @@ pub const TT_DEFAULT: TTEntry = TTEntry { score: 0, best_move: 0, depth: 0, flag
 /// Default TT size: 2^20 entries = ~8 MB.
 pub const TT_DEFAULT_SIZE: usize = 1 << 20;
 
-/// Adjust a score for TT storage: convert ply-relative mate scores to node-relative.
+/// Adjust a score for TT storage: convert ply-relative mate/frozen scores to node-relative.
 fn score_to_tt(score: i32, ply: u32) -> i16 {
-    let adjusted = if score > MATE_SCORE - 100 {
-        score + ply as i32  // storing a positive mate: add ply to make it node-relative
-    } else if score < -(MATE_SCORE - 100) {
-        score - ply as i32  // storing a negative mate: subtract ply
+    let adjusted = if score > TT_PLY_SCORE_MIN {
+        score + ply as i32  // storing a positive mate/frozen: add ply to make it node-relative
+    } else if score < -TT_PLY_SCORE_MIN {
+        score - ply as i32  // storing a negative mate/frozen: subtract ply
     } else {
         score
     };
     adjusted.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// Adjust a score from TT retrieval: convert node-relative mate scores to ply-relative.
+/// Adjust a score from TT retrieval: convert node-relative mate/frozen scores to ply-relative.
 fn score_from_tt(score: i16, ply: u32) -> i32 {
     let s = score as i32;
-    if s > MATE_SCORE - 100 {
+    if s > TT_PLY_SCORE_MIN {
         s - ply as i32
-    } else if s < -(MATE_SCORE - 100) {
+    } else if s < -TT_PLY_SCORE_MIN {
         s + ply as i32
     } else {
         s
@@ -70,6 +71,20 @@ const MAX_DEPTH: u32 = 64;
 
 /// Mate score base value. Actual mate scores are `MATE_SCORE - ply` to prefer shorter mates.
 const MATE_SCORE: i32 = 30000;
+
+/// Frozen-position score base. A side is "frozen" when it is in check with no
+/// legal moves while `status()` still reports Ongoing: the check is drop-blockable,
+/// so under bughouse rules the player sits and waits for their partner to supply a
+/// blocking piece. In practice this is nearly always lost — the opponent gains
+/// unlimited tempo and the sitter can flag — so it is scored just below the mate
+/// band as `FROZEN_SCORE - ply` (prefer freezing the opponent sooner). Kept distinct
+/// from MATE_SCORE so scores can distinguish "mated" from "forced to sit".
+const FROZEN_SCORE: i32 = 28000;
+
+/// Scores at or above this magnitude are ply-relative (mate or frozen) and are
+/// converted to node-relative form for TT storage. Static evals can never reach
+/// this range.
+const TT_PLY_SCORE_MIN: i32 = 27000;
 
 /// How often to check the clock (every N nodes).
 const TIME_CHECK_INTERVAL: usize = 1024;
@@ -209,14 +224,74 @@ fn generate_moves(board: &Board) -> Vec<BughouseMove> {
 
     // Use library's legal drop generation, then prune to relevant squares
     let drop_mask = build_drop_mask(board);
-    for drop_move in MoveGen::drop_moves(board) {
-        if let BughouseMove::Drop { square, .. } = &drop_move {
+    let drops = MoveGen::drop_moves(board);
+    for drop_move in &drops {
+        if let BughouseMove::Drop { square, .. } = drop_move {
             if (drop_mask & BitBoard::from_square(*square)) != EMPTY {
-                moves.push(drop_move);
+                moves.push(drop_move.clone());
             }
         }
     }
 
+    // If pruning removed every candidate but legal drops exist, keep them all.
+    // An empty result must mean the position truly has no legal moves — the
+    // frozen-check detection in negamax depends on this invariant.
+    if moves.is_empty() && !drops.is_empty() {
+        moves = drops;
+    }
+
+    moves
+}
+
+/// A board is frozen when the side to move is in check with no legal moves while
+/// `status()` still reports Ongoing (the check is drop-blockable): under bughouse
+/// rules they must sit until their partner supplies a blocking piece. Also true
+/// for actual checkmate — callers must check `status()` first.
+fn is_frozen(board: &Board) -> bool {
+    *board.checkers() != EMPTY
+        && MoveGen::new_legal(board).len() == 0
+        && MoveGen::drop_moves(board).is_empty()
+}
+
+/// Generate all drops that give check: for each piece type in our reserve, the
+/// empty squares from which that piece would attack the enemy king. Uses attack
+/// symmetry — a piece on square `s` attacks the king on `k` iff `s` is in the
+/// piece's attack set computed *from* `k` with the current occupancy. Drops never
+/// create discovered checks, so this is exact.
+///
+/// Only valid when the side to move is NOT in check (arbitrary drops are illegal
+/// while in check — only blocking drops are, and those come from `drop_moves`).
+fn generate_checking_drops(board: &Board) -> Vec<BughouseMove> {
+    let us = board.side_to_move();
+    let reserve = &board.reserves()[us.to_index()];
+    if reserve.is_empty() {
+        return Vec::new();
+    }
+
+    let combined = *board.combined();
+    let empty = !combined;
+    let enemy_king_sq = board.king_square(!us);
+    let back_ranks = get_rank(Rank::First) | get_rank(Rank::Eighth);
+
+    let mut moves = Vec::new();
+    for (piece, _count) in reserve.iter() {
+        let checking_squares = match piece {
+            Piece::Knight => get_knight_moves(enemy_king_sq),
+            Piece::Rook => get_rook_moves(enemy_king_sq, combined),
+            Piece::Bishop => get_bishop_moves(enemy_king_sq, combined),
+            Piece::Queen => {
+                get_rook_moves(enemy_king_sq, combined) | get_bishop_moves(enemy_king_sq, combined)
+            }
+            // A pawn on `s` checks the king iff `s` is a pawn-attack square of
+            // the *opposite* color computed from the king square.
+            Piece::Pawn => get_pawn_attack_squares(enemy_king_sq, !us) & !back_ranks,
+            Piece::King => EMPTY,
+        } & empty;
+
+        for square in checking_squares {
+            moves.push(BughouseMove::Drop { piece, square });
+        }
+    }
     moves
 }
 
@@ -315,10 +390,20 @@ fn make_move(board: &Board, m: &BughouseMove) -> Option<Board> {
     }
 }
 
-/// Quiescence search: continue searching captures at the horizon until
-/// the position is quiet. Prevents the horizon effect where the engine
-/// stops looking right before a recapture or tactical sequence.
-fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext) -> i32 {
+/// Quiescence search: continue searching captures (and, near the horizon,
+/// checking drops) until the position is quiet. Prevents the horizon effect
+/// where the engine stops looking right before a recapture or a drop-check
+/// tactic — the core bughouse attacking motif.
+///
+/// `check_depth` counts down each qsearch ply; checking drops are generated
+/// while it is > 0 (initial value: `config.qs_check_drop_depth`). At the
+/// default of 1, drops are generated only at the horizon entry itself; the
+/// resulting evasions and recaptures are still searched, and frozen/checkmate
+/// children are detected via status, so the freeze motif survives.
+///
+/// While in check there is no stand-pat: every evasion is searched, so forcing
+/// drop-check sequences are evaluated soundly.
+fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut SearchContext, check_depth: u32) -> i32 {
     // Abort check every node (cheap atomic load)
     if let Some(abort) = ctx.abort {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
@@ -341,29 +426,49 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
         BoardStatus::Ongoing => {}
     }
 
+    // Frozen: in check with no legal response, but drop-blockable — near-loss.
+    // Checked here so freezes are visible at the search horizon.
+    let in_check = *board.checkers() != EMPTY;
+    if in_check && is_frozen(board) {
+        return -(FROZEN_SCORE - ply as i32);
+    }
+
     ctx.nodes += 1;
-    let stand_pat = scoring::evaluate_with_config(board, ctx.config);
 
-    // Beta cutoff: position is already good enough without capturing
-    if stand_pat >= beta {
-        return beta;
+    let mut moves: Vec<BughouseMove>;
+    if in_check {
+        // In check: no stand-pat (standing still is not an option) — search
+        // every evasion. Evasion counts are small, so this stays cheap.
+        moves = generate_moves(board);
+    } else {
+        let stand_pat = scoring::evaluate_with_config(board, ctx.config);
+
+        // Beta cutoff: position is already good enough without capturing
+        if stand_pat >= beta {
+            return beta;
+        }
+        if stand_pat > alpha {
+            alpha = stand_pat;
+        }
+
+        moves = MoveGen::capture_moves(board)
+            .map(BughouseMove::Regular)
+            .collect();
+
+        // Checking drops near the horizon (bounded by check_depth)
+        if check_depth > 0 {
+            moves.extend(generate_checking_drops(board));
+        }
+
+        if moves.is_empty() {
+            return alpha; // Position is quiet
+        }
     }
-    if stand_pat > alpha {
-        alpha = stand_pat;
-    }
 
-    // Generate and order capture moves only
-    let mut captures: Vec<BughouseMove> = MoveGen::capture_moves(board)
-        .map(BughouseMove::Regular)
-        .collect();
+    order_moves(board, &mut moves, &ctx.history, ctx.config);
 
-    if captures.is_empty() {
-        return alpha; // Position is quiet
-    }
-
-    order_moves(board, &mut captures, &ctx.history, ctx.config);
-
-    for m in &captures {
+    let mut searched_any = false;
+    for m in &moves {
         if ctx.time_up {
             break;
         }
@@ -373,7 +478,8 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
             None => continue,
         };
 
-        let score = -quiescence(&child, ply + 1, -beta, -alpha, ctx);
+        let score = -quiescence(&child, ply + 1, -beta, -alpha, ctx, check_depth.saturating_sub(1));
+        searched_any = true;
 
         if ctx.time_up {
             break;
@@ -385,6 +491,13 @@ fn quiescence(board: &Board, ply: u32, mut alpha: i32, beta: i32, ctx: &mut Sear
         if alpha >= beta {
             break; // Beta cutoff
         }
+    }
+
+    // Defensive: while in check, alpha was never anchored to a stand-pat. If no
+    // evasion could actually be searched (library move-gen edge cases), fall
+    // back to static eval rather than leaking the caller's raw alpha bound.
+    if in_check && !searched_any {
+        return scoring::evaluate_with_config(board, ctx.config);
     }
 
     alpha
@@ -417,9 +530,9 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
         BoardStatus::Ongoing => {}
     }
 
-    // Leaf node: quiescence search (captures only until position is quiet)
+    // Leaf node: quiescence search (captures + near-horizon checking drops)
     if depth == 0 {
-        return quiescence(board, ply, alpha, beta, ctx);
+        return quiescence(board, ply, alpha, beta, ctx, ctx.config.qs_check_drop_depth);
     }
 
     let original_alpha = alpha;
@@ -449,10 +562,13 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
 
     let mut moves = generate_moves(board);
 
-    // No moves but not checkmate/stalemate (shouldn't happen with correct move gen, but be safe)
+    // No legal moves at all. Checkmate/stalemate were handled above, so this
+    // means the side to move is frozen: in check with no legal response, but
+    // the check is drop-blockable (status() == Ongoing). They must sit and
+    // wait for a piece their partner may never deliver — score as a near-loss.
     if moves.is_empty() {
         ctx.nodes += 1;
-        return scoring::evaluate_with_config(board, ctx.config);
+        return -(FROZEN_SCORE - ply as i32);
     }
 
     order_moves(board, &mut moves, &ctx.history, ctx.config);
@@ -563,6 +679,13 @@ fn negamax(board: &Board, depth: u32, ply: u32, mut alpha: i32, beta: i32, ctx: 
             }
             break; // Beta cutoff
         }
+    }
+
+    // Defensive: if no child position could be searched at all (library
+    // move-gen edge cases on corrupt/illegal positions), fall back to static
+    // eval rather than leaking the -infinity sentinel to the parent.
+    if best_score == i32::MIN + 1 {
+        return scoring::evaluate_with_config(board, ctx.config);
     }
 
     // TT store (skip if time ran out mid-search — result is incomplete)
@@ -1079,9 +1202,12 @@ mod tests {
 
     #[test]
     fn finds_checkmate_move() {
-        // Qg6-g7# — queen on g7 defended by bishop f6. Adjacent check. Mate!
+        // Qg6-g7# — queen on g7 defended by pawn f6. Adjacent check, so it is
+        // true checkmate even under bughouse rules (not drop-blockable).
+        // (Previously used a bishop on f6, but that position was illegal —
+        // the bishop already checked h8 with white to move.)
         let board: Board =
-            "7k/7p/5BQ1/8/8/8/8/7K[] w - - 0 1"
+            "7k/7p/5PQ1/8/8/8/8/7K[] w - - 0 1"
                 .parse()
                 .unwrap();
         let result = search(&board, 1).unwrap();
@@ -1307,7 +1433,7 @@ mod tests {
         // A mate in 1 should score MATE_SCORE - 1 = 29999
         // Use depth 1 to avoid library issues with sparse endgame positions
         let board: Board =
-            "7k/7p/5BQ1/8/8/8/8/7K[] w - - 0 1"
+            "7k/7p/5PQ1/8/8/8/8/7K[] w - - 0 1"
                 .parse()
                 .unwrap();
         let result = search(&board, 1).unwrap();
@@ -1518,7 +1644,7 @@ mod tests {
     fn tt_mate_score_correct() {
         // Mate in 1 should still score correctly with TT
         let board: Board =
-            "7k/7p/5BQ1/8/8/8/8/7K[] w - - 0 1"
+            "7k/7p/5PQ1/8/8/8/8/7K[] w - - 0 1"
                 .parse()
                 .unwrap();
         let result = search(&board, 1).unwrap();
@@ -1545,7 +1671,7 @@ mod tests {
             abort: None,
             config: &EngineConfig::default(),
         };
-        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx, 1);
         let static_eval = scoring::evaluate(&board);
         assert_eq!(score, static_eval,
             "quiescence in quiet position should match static eval: got {}, expected {}",
@@ -1579,7 +1705,7 @@ mod tests {
             abort: None,
             config: &EngineConfig::default(),
         };
-        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx, 1);
         // Black can capture a knight (+320cp) so quiescence should score
         // significantly better than just stand_pat
         let static_eval = scoring::evaluate(&board);
@@ -1610,12 +1736,156 @@ mod tests {
             abort: None,
             config: &EngineConfig::default(),
         };
-        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx);
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx, 1);
         let static_eval = scoring::evaluate(&board);
         assert!(score >= static_eval,
             "quiescence should never be worse than stand_pat: score={}, static_eval={}",
             score, static_eval
         );
+    }
+
+    #[test]
+    fn checking_drops_match_brute_force() {
+        // Fast attack-symmetry generation must exactly match filtering all
+        // legal drops by "does the child position leave the opponent in check".
+        // Black king on e5 is open, so all five piece types produce checks
+        // (including pawn drops from d4/f4).
+        let board: Board = "r7/5ppp/8/4k3/8/8/5PPP/R5K1[QRBNP] w - - 0 1"
+            .parse()
+            .unwrap();
+
+        let fast: std::collections::HashSet<String> = generate_checking_drops(&board)
+            .iter()
+            .map(|m| format!("{}", m))
+            .collect();
+
+        let brute: std::collections::HashSet<String> = MoveGen::drop_moves(&board)
+            .into_iter()
+            .filter(|m| {
+                make_move(&board, m)
+                    .map(|child| *child.checkers() != EMPTY)
+                    .unwrap_or(false)
+            })
+            .map(|m| format!("{}", m))
+            .collect();
+
+        assert!(!fast.is_empty(), "should generate some checking drops");
+        assert_eq!(fast, brute, "fast generation must match brute force");
+        // Pawn checks specifically (d4 and f4 attack e5 for white)
+        assert!(fast.contains("p@d4"), "missing pawn check p@d4: {:?}", fast);
+        assert!(fast.contains("p@f4"), "missing pawn check p@f4: {:?}", fast);
+    }
+
+    #[test]
+    fn quiescence_finds_freezing_drop_check() {
+        // White to move holding a rook; r@e8 freezes black. The freeze must be
+        // visible from quiescence itself (checking drops at the horizon), not
+        // just from root move generation.
+        let board: Board = "6k1/5ppp/8/8/8/8/5PPP/6K1[R] w - - 0 1"
+            .parse()
+            .unwrap();
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let mut ctx = SearchContext {
+            start: Instant::now(),
+            budget_ms: 0,
+            nodes: 0,
+            time_up: false,
+            tt: &mut tt,
+            killers: [[0; NUM_KILLERS]; MAX_DEPTH as usize],
+            history: [[[0; 64]; 64]; 2],
+            abort: None,
+            config: &EngineConfig::default(),
+        };
+        let score = quiescence(&board, 0, i32::MIN + 1, i32::MAX - 1, &mut ctx, 1);
+        assert_eq!(score, FROZEN_SCORE - 1,
+            "quiescence should find the freezing r@e8, got {}", score);
+    }
+
+    #[test]
+    fn engine_defends_against_freeze_threat() {
+        // White to move; black holds a rook and threatens r@e1, freezing the
+        // boxed white king. At depth 1 the threat only appears in quiescence
+        // (after white's move, black's checking drops are horizon moves).
+        // The engine must pick a move that defuses it: luft (f3/g3/h3) or Kf1
+        // (which gains the e2 escape square).
+        let board: Board = "6k1/5ppp/8/8/8/8/P4PPP/6K1[r] w - - 0 1"
+            .parse()
+            .unwrap();
+        let result = search(&board, 1).unwrap();
+        let chosen = format!("{}", result.best_move);
+        let defenses = ["f2f3", "g2g3", "h2h3", "g1f1"];
+        assert!(defenses.contains(&chosen.as_str()),
+            "should defuse the freeze threat, chose {} (score {})", chosen, result.score);
+        assert!(result.score > -(FROZEN_SCORE - 1000),
+            "a defense exists, so score must not be in the frozen band: {}", result.score);
+    }
+
+    #[test]
+    fn frozen_opponent_scored_near_loss() {
+        // r@e8 leaves black in check with no legal moves and an empty reserve.
+        // status() stays Ongoing (the check is blockable on f8 by a future drop),
+        // but black must sit — the search should treat this as nearly winning.
+        // Found at depth 1 via the quiescence frozen check.
+        let board: Board = "6k1/5ppp/8/8/8/8/5PPP/6K1[R] w - - 0 1"
+            .parse()
+            .unwrap();
+        let result = search(&board, 1).unwrap();
+        assert_eq!(format!("{}", result.best_move), "r@e8",
+            "should freeze black with the back-rank rook drop");
+        assert_eq!(result.score, FROZEN_SCORE - 1,
+            "frozen at ply 1 should score FROZEN_SCORE - 1");
+    }
+
+    #[test]
+    fn frozen_score_stable_across_depths() {
+        let board: Board = "6k1/5ppp/8/8/8/8/5PPP/6K1[R] w - - 0 1"
+            .parse()
+            .unwrap();
+        let result = search(&board, 3).unwrap();
+        assert_eq!(format!("{}", result.best_move), "r@e8");
+        assert_eq!(result.score, FROZEN_SCORE - 1,
+            "deeper search should agree on the frozen score");
+    }
+
+    #[test]
+    fn pawn_in_reserve_cannot_block_back_rank() {
+        // Black holds a pawn, but pawns can't be dropped on the 8th rank, so
+        // r@e8 still freezes: no legal drop exists even with a non-empty reserve.
+        let board: Board = "6k1/5ppp/8/8/8/8/5PPP/6K1[Rp] w - - 0 1"
+            .parse()
+            .unwrap();
+        let result = search(&board, 2).unwrap();
+        assert_eq!(format!("{}", result.best_move), "r@e8");
+        assert_eq!(result.score, FROZEN_SCORE - 1,
+            "pawn in hand cannot block on rank 8 — still frozen");
+    }
+
+    #[test]
+    fn blockable_check_with_blocker_not_frozen() {
+        // Same freeze attempt, but black holds a knight: n@f8 blocks the check,
+        // so the position after r@e8 is not frozen and no frozen-band score
+        // should appear.
+        let board: Board = "6k1/5ppp/8/8/8/8/5PPP/6K1[Rn] w - - 0 1"
+            .parse()
+            .unwrap();
+        let result = search(&board, 2).unwrap();
+        assert!(result.score < FROZEN_SCORE - 1000,
+            "black can block with n@f8 — not frozen, got score {}", result.score);
+    }
+
+    #[test]
+    fn frozen_side_evaluated_as_lost() {
+        // From the frozen side's perspective: black to move, in check from Re8,
+        // no legal moves, empty reserve. Direct negamax should report near-loss.
+        let board: Board = "4R1k1/5ppp/8/8/8/8/5PPP/6K1[] b - - 0 1"
+            .parse()
+            .unwrap();
+        assert_eq!(board.status(), BoardStatus::Ongoing,
+            "drop-blockable check should report Ongoing");
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let score = evaluate_position(&board, 2, &mut tt, &EngineConfig::default());
+        assert_eq!(score, -FROZEN_SCORE,
+            "frozen side at ply 0 should score -FROZEN_SCORE");
     }
 
     #[test]

@@ -48,6 +48,11 @@ pub struct EngineConfig {
     pub rook_reserve_pct: i32,
     pub queen_reserve_pct: i32,
 
+    // ── Quiescence ──
+    /// How many plies into quiescence checking drops are generated.
+    /// 0 disables them (captures-only horizon). Benchmarkable trade-off:
+    /// deeper = sees more drop-check tactics, but a larger qsearch tree.
+    pub qs_check_drop_depth: u32,
 }
 
 impl Default for EngineConfig {
@@ -92,6 +97,9 @@ impl Default for EngineConfig {
             bishop_reserve_pct: 130,
             rook_reserve_pct: 120,
             queen_reserve_pct: 120,
+
+            // Quiescence
+            qs_check_drop_depth: 1,
         }
     }
 }
@@ -141,6 +149,9 @@ impl EngineConfig {
             "bishopreservepct" => { if let Ok(v) = value.parse() { self.bishop_reserve_pct = v; return true; } }
             "rookreservepct" => { if let Ok(v) = value.parse() { self.rook_reserve_pct = v; return true; } }
             "queenreservepct" => { if let Ok(v) = value.parse() { self.queen_reserve_pct = v; return true; } }
+
+            // Quiescence
+            "qscheckdropdepth" => { if let Ok(v) = value.parse() { self.qs_check_drop_depth = v; return true; } }
 
             _ => {}
         }
@@ -249,6 +260,16 @@ mod tests {
 
         assert!(cfg.apply_option("PAWNVALUE", "110"));
         assert_eq!(cfg.pawn_value, 110);
+    }
+
+    #[test]
+    fn apply_option_qs_check_drop_depth() {
+        let mut cfg = EngineConfig::default();
+        assert_eq!(cfg.qs_check_drop_depth, 1);
+        assert!(cfg.apply_option("QsCheckDropDepth", "0"));
+        assert_eq!(cfg.qs_check_drop_depth, 0);
+        assert!(cfg.apply_option("qscheckdropdepth", "2"));
+        assert_eq!(cfg.qs_check_drop_depth, 2);
     }
 
     #[test]
