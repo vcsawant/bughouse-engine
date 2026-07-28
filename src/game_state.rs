@@ -680,8 +680,10 @@ fn handle_go(state: &mut EngineState, board_id: BoardId) -> Vec<UbiResponse> {
 
             // Aggressiveness threshold: only allow cross-board override if the
             // cross-board value exceeds the threshold for our PlayStyle.
-            // Use the eval thread's best_move directly — root move scores are
-            // fail-soft and ties are common (non-best moves get cutoff score).
+            // Use the eval thread's best_move directly for the local-best
+            // identity. Root scores for captures are exact (searched with a
+            // full window — they're the cross-board candidates); quiet-move
+            // scores other than the best are still fail-soft bounds.
             let threshold = state.config.aggressiveness_threshold(play_style);
             let best_local_move = eval_status.best_move.as_ref().map(|m| format_move(m));
             let (adjusted_best_str, _, adjusted_best_cross, adjusted_best_score, _) = &scored_moves[0];

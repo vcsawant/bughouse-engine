@@ -736,17 +736,26 @@ fn search_at_depth(board: &Board, moves: &[BughouseMove], depth: u32, ctx: &mut 
             None => continue,
         };
 
-        let score = -negamax(&child, depth - 1, 1, -(i32::MAX - 1), -best_score.max(i32::MIN + 1), ctx);
-
-        if ctx.time_up {
-            break;
-        }
-
         // Determine what this move captures (if anything)
         let captured = match m {
             BughouseMove::Regular(cm) => board.piece_on(cm.get_dest()),
             BughouseMove::Drop { .. } => None,
         };
+
+        // Captures get a full window so their root scores are exact — the
+        // cross-board ranking and P/C statistics consume capture scores as
+        // real values, and only captures carry cross-board value. Everything
+        // else only needs to answer "does this beat the best so far?", so it
+        // keeps the cheap narrowed window.
+        let score = if captured.is_some() {
+            -negamax(&child, depth - 1, 1, -(i32::MAX - 1), i32::MAX - 1, ctx)
+        } else {
+            -negamax(&child, depth - 1, 1, -(i32::MAX - 1), -best_score.max(i32::MIN + 1), ctx)
+        };
+
+        if ctx.time_up {
+            break;
+        }
 
         root_evals.push(RootMoveEval { mv: m.clone(), score, captured });
 
@@ -1490,6 +1499,42 @@ mod tests {
         } else {
             panic!("first ordered move should be a regular capture");
         }
+    }
+
+    #[test]
+    fn root_capture_scores_are_exact() {
+        // Black queen hangs on e5 (Nxe5) and black knight hangs on a3 (bxa3).
+        // MVV-LVA searches the queen capture first, so under the old
+        // beat-the-best window the knight capture returned a fail-soft bound.
+        // Its reported root score must equal an independent full-window search
+        // of the child position.
+        let board: Board =
+            "rnb1kb1r/pppp1ppp/8/4q3/8/n4N2/PPPPPPPP/R1BQKB1R[] w KQkq - 0 1"
+                .parse()
+                .unwrap();
+        let config = EngineConfig::default();
+        let result = find_best_move(&board, 2, &config).unwrap();
+
+        let queen_capture = result.root_move_evals.iter()
+            .find(|e| format!("{}", e.mv) == "f3e5")
+            .expect("Nxe5 should be a root move");
+        let knight_capture = result.root_move_evals.iter()
+            .find(|e| format!("{}", e.mv) == "b2a3")
+            .expect("bxa3 should be a root move");
+
+        assert!(queen_capture.score > knight_capture.score,
+            "queen capture ({}) should outscore knight capture ({})",
+            queen_capture.score, knight_capture.score);
+
+        // Exactness: recompute the knight capture's true value independently.
+        let child = board.make_move_new(match knight_capture.mv {
+            BughouseMove::Regular(cm) => cm,
+            _ => panic!("bxa3 is a regular move"),
+        });
+        let mut tt = CacheTable::new(TT_DEFAULT_SIZE, TT_DEFAULT);
+        let expected = -evaluate_position(&child, 1, &mut tt, &config);
+        assert_eq!(knight_capture.score, expected,
+            "non-best capture score must be exact, not a fail-soft bound");
     }
 
     #[test]
