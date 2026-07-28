@@ -53,6 +53,16 @@ pub struct EngineConfig {
     /// 0 disables them (captures-only horizon). Benchmarkable trade-off:
     /// deeper = sees more drop-check tactics, but a larger qsearch tree.
     pub qs_check_drop_depth: u32,
+
+    // ── Dynamic reserve valuation ──
+    /// Percentage points added to non-pawn reserve multipliers per 100cp of
+    /// ENEMY king exposure (attack ammunition). 0 = static multipliers.
+    pub reserve_attack_scale: i32,
+    /// Percentage points added to the pawn reserve multiplier per 100cp of
+    /// OWN king exposure (shielding/blocking resource). 0 = static.
+    pub reserve_defense_scale: i32,
+    /// Cap on dynamically added percentage points per piece.
+    pub reserve_dynamic_cap: i32,
 }
 
 impl Default for EngineConfig {
@@ -100,6 +110,11 @@ impl Default for EngineConfig {
 
             // Quiescence
             qs_check_drop_depth: 1,
+
+            // Dynamic reserve valuation
+            reserve_attack_scale: 20,
+            reserve_defense_scale: 20,
+            reserve_dynamic_cap: 60,
         }
     }
 }
@@ -152,6 +167,11 @@ impl EngineConfig {
 
             // Quiescence
             "qscheckdropdepth" => { if let Ok(v) = value.parse() { self.qs_check_drop_depth = v; return true; } }
+
+            // Dynamic reserve valuation
+            "reserveattackscale" => { if let Ok(v) = value.parse() { self.reserve_attack_scale = v; return true; } }
+            "reservedefensescale" => { if let Ok(v) = value.parse() { self.reserve_defense_scale = v; return true; } }
+            "reservedynamiccap" => { if let Ok(v) = value.parse() { self.reserve_dynamic_cap = v; return true; } }
 
             _ => {}
         }
@@ -207,13 +227,14 @@ impl EngineConfig {
     /// One-line summary of tunable parameters for game header logging.
     pub fn tuning_summary(&self) -> String {
         format!(
-            "P={} N={} B={} R={} Q={} res=[{}%,{}%,{}%,{}%,{}%] \
+            "P={} N={} B={} R={} Q={} res=[{}%,{}%,{}%,{}%,{}%] resdyn=[{},{},{}] \
              style=[{:.1},{:.1},{:.1}] aggr=[{},{},{}] \
              time=[{}/{}/{}/{}/{}] clocks=[{},{},{},{}]",
             self.pawn_value, self.knight_value, self.bishop_value,
             self.rook_value, self.queen_value,
             self.pawn_reserve_pct, self.knight_reserve_pct, self.bishop_reserve_pct,
             self.rook_reserve_pct, self.queen_reserve_pct,
+            self.reserve_attack_scale, self.reserve_defense_scale, self.reserve_dynamic_cap,
             self.blitz_style_factor, self.standard_style_factor, self.extended_style_factor,
             self.blitz_aggression, self.standard_aggression, self.extended_aggression,
             self.blitz_divisor, self.standard_divisor, self.extended_divisor,
@@ -270,6 +291,20 @@ mod tests {
         assert_eq!(cfg.qs_check_drop_depth, 0);
         assert!(cfg.apply_option("qscheckdropdepth", "2"));
         assert_eq!(cfg.qs_check_drop_depth, 2);
+    }
+
+    #[test]
+    fn apply_option_reserve_dynamics() {
+        let mut cfg = EngineConfig::default();
+        assert_eq!(cfg.reserve_attack_scale, 20);
+        assert_eq!(cfg.reserve_defense_scale, 20);
+        assert_eq!(cfg.reserve_dynamic_cap, 60);
+        assert!(cfg.apply_option("ReserveAttackScale", "0"));
+        assert!(cfg.apply_option("ReserveDefenseScale", "40"));
+        assert!(cfg.apply_option("ReserveDynamicCap", "80"));
+        assert_eq!(cfg.reserve_attack_scale, 0);
+        assert_eq!(cfg.reserve_defense_scale, 40);
+        assert_eq!(cfg.reserve_dynamic_cap, 80);
     }
 
     #[test]

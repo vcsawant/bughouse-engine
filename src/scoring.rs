@@ -34,29 +34,17 @@ pub fn piece_value(piece: Piece) -> i32 {
     }
 }
 
-/// Reserve premium multiplier (percentage) per piece type.
-/// Reserves are valued *higher* than on-board pieces because of placement
-/// flexibility — you can drop them on any empty square.
-///
-/// - Knights (160%): extremely flexible drop targets, fork potential
-/// - Pawns (130%): great for blocking attacks and shielding the king
-/// - Bishops (130%): good defensive drops, diagonal coverage
-/// - Rooks (120%): powerful but already highly valued
-/// - Queens (120%): powerful but already highly valued
-///
-/// TODO: make multipliers dynamic based on board position (Phase E).
-/// E.g. knights worth more when opponent king is exposed, pawns worth more
-/// when own king needs shielding, etc.
-fn reserve_multiplier(piece: Piece) -> i32 {
-    match piece {
-        Piece::Knight => 160,
-        Piece::Pawn => 130,
-        Piece::Bishop => 130,
-        Piece::Rook => 120,
-        Piece::Queen => 120,
-        Piece::King => 0,
-    }
-}
+// Reserve premium multipliers (config, defaults in EngineConfig):
+// Reserves are valued *higher* than on-board pieces because of placement
+// flexibility — you can drop them on any empty square.
+//
+// - Knights (160%): extremely flexible drop targets, fork potential
+// - Pawns (130%): great for blocking attacks and shielding the king
+// - Bishops (130%): good defensive drops, diagonal coverage
+// - Rooks/Queens (120%): powerful but already highly valued
+//
+// On top of the static base, multipliers are adjusted dynamically by king
+// exposure — see `reserve_score_dyn`.
 
 // ─── Piece-Square Tables ────────────────────────────────────────────
 // Indexed from white's perspective (a1=0, h8=63).
@@ -148,37 +136,41 @@ fn pst_for_piece(piece: Piece) -> &'static [i32; 64] {
 
 // ─── Evaluation Components ──────────────────────────────────────────
 
-/// Material count for one color (on-board pieces only).
-fn material_score(board: &Board, color: Color) -> i32 {
-    let mut score = 0;
-    for piece in ALL_PIECES {
-        if piece == Piece::King {
-            continue;
-        }
-        let count = (*board.pieces(piece) & *board.color_combined(color)).popcnt() as i32;
-        score += count * piece_value(piece);
-    }
-    score
-}
-
-/// Reserve value for one color with per-piece premium multiplier.
-fn reserve_score(board: &Board, color: Color) -> i32 {
+/// Reserve value for one color with dynamic position-aware multipliers.
+///
+/// The static base multiplier (config) is adjusted by king exposure:
+/// - Attack bonus: non-pawn pieces gain value as the ENEMY king grows exposed —
+///   they are drop-attack ammunition.
+/// - Defense bonus: pawns gain value as OUR king grows exposed — the premier
+///   blocking and shielding drop.
+///
+/// Exposure is the non-negative magnitude of `king_safety_base` (raw shield /
+/// open-file / attack-zone penalties, before the reserve amplifier). Added
+/// percentage points = exposure * scale / 100, capped by
+/// `reserve_dynamic_cap`. Scale 0 restores static multipliers.
+fn reserve_score_dyn(
+    board: &Board,
+    color: Color,
+    config: &EngineConfig,
+    own_exposure: i32,
+    enemy_exposure: i32,
+) -> i32 {
     let reserve = &board.reserves()[color.to_index()];
     let mut score = 0;
     for (piece, count) in reserve.iter() {
-        score += count as i32 * piece_value(piece) * reserve_multiplier(piece) / 100;
+        let base_pct = config.reserve_multiplier_pct(piece);
+        let bonus_pct = match piece {
+            Piece::Pawn => {
+                (own_exposure * config.reserve_defense_scale / 100).min(config.reserve_dynamic_cap)
+            }
+            Piece::King => 0,
+            _ => {
+                (enemy_exposure * config.reserve_attack_scale / 100).min(config.reserve_dynamic_cap)
+            }
+        };
+        score += count as i32 * config.piece_value(piece) * (base_pct + bonus_pct) / 100;
     }
     score
-}
-
-/// Total reserve material value (full price, no discount) for one color.
-fn reserve_material_value(board: &Board, color: Color) -> i32 {
-    let reserve = &board.reserves()[color.to_index()];
-    let mut value = 0;
-    for (piece, count) in reserve.iter() {
-        value += count as i32 * piece_value(piece);
-    }
-    value
 }
 
 /// Piece-square table score for one color.
@@ -257,17 +249,17 @@ fn king_safety_base(board: &Board, color: Color) -> i32 {
     penalty
 }
 
-/// King safety score for one color (negative = bad, penalty).
-/// Uses default piece values for reserve amplifier.
-fn king_safety(board: &Board, color: Color) -> i32 {
-    let penalty = king_safety_base(board, color);
-    if penalty >= 0 { return penalty; }
-
-    // (d) Reserve amplifier: scale penalty by opponent's reserve value.
-    // Same formula as king_safety_cfg: 1 + reserve_value/500.
-    let opp_reserve_val = reserve_material_value(board, !color);
-    let amplifier = 100 + opp_reserve_val / 5;
-    penalty * amplifier / 100
+/// King safety amplified by the opponent's reserve material: an exposed king
+/// is far more dangerous when the opponent holds pieces to drop.
+/// `base` is this color's `king_safety_base` (≤ 0). Amplifier: 1 + reserve/500.
+fn king_safety_amplified(board: &Board, color: Color, config: &EngineConfig, base: i32) -> i32 {
+    let reserve = &board.reserves()[(!color).to_index()];
+    let mut opp_reserve_value = 0;
+    for (piece, count) in reserve.iter() {
+        opp_reserve_value += count as i32 * config.piece_value(piece);
+    }
+    let amplifier = 100 + opp_reserve_value / 5;
+    base * amplifier / 100
 }
 
 /// Mobility score for one color.
@@ -366,8 +358,10 @@ pub struct EvalBreakdown {
 }
 
 /// Evaluate a position with full component breakdown, returning centipawns
-/// from the perspective of `board.side_to_move()`. Positive = good for the side to move.
-pub fn evaluate_detailed(board: &Board) -> EvalBreakdown {
+/// from the perspective of `board.side_to_move()`. Positive = good for the
+/// side to move. This is THE evaluation implementation — `evaluate` and
+/// `evaluate_with_config` both delegate here so the paths cannot diverge.
+pub fn evaluate_detailed(board: &Board, config: &EngineConfig) -> EvalBreakdown {
     // Terminal checks
     match board.status() {
         BoardStatus::Checkmate => {
@@ -399,11 +393,20 @@ pub fn evaluate_detailed(board: &Board) -> EvalBreakdown {
     let white = Color::White;
     let black = Color::Black;
 
+    // King safety bases are shared by the safety term (amplified) and the
+    // dynamic reserve multipliers (exposure), so compute them once.
+    let ks_base_w = king_safety_base(board, white);
+    let ks_base_b = king_safety_base(board, black);
+    let exposure_w = (-ks_base_w).max(0);
+    let exposure_b = (-ks_base_b).max(0);
+
     // Compute each component for white and black (from white's perspective)
-    let mat = material_score(board, white) - material_score(board, black);
-    let res = reserve_score(board, white) - reserve_score(board, black);
+    let mat = material_score_cfg(board, white, config) - material_score_cfg(board, black, config);
+    let res = reserve_score_dyn(board, white, config, exposure_w, exposure_b)
+        - reserve_score_dyn(board, black, config, exposure_b, exposure_w);
     let pst_val = pst_score(board, white) - pst_score(board, black);
-    let king = king_safety(board, white) - king_safety(board, black);
+    let king = king_safety_amplified(board, white, config, ks_base_w)
+        - king_safety_amplified(board, black, config, ks_base_b);
     let mob = mobility_score(board, white) - mobility_score(board, black);
     let pawns = pawn_structure(board, white) - pawn_structure(board, black);
 
@@ -428,37 +431,15 @@ pub fn evaluate_detailed(board: &Board) -> EvalBreakdown {
 
 /// Evaluate a position, returning centipawns from the perspective of
 /// `board.side_to_move()`. Positive = good for the side to move.
-/// Uses default piece values and reserve multipliers.
+/// Uses default config values.
 pub fn evaluate(board: &Board) -> i32 {
-    evaluate_detailed(board).total
+    evaluate_with_config(board, &EngineConfig::default())
 }
 
 /// Evaluate a position using configurable piece values and reserve multipliers.
 /// Returns centipawns from the perspective of `board.side_to_move()`.
 pub fn evaluate_with_config(board: &Board, config: &EngineConfig) -> i32 {
-    match board.status() {
-        BoardStatus::Checkmate => return -30000,
-        BoardStatus::Stalemate => return 0,
-        BoardStatus::Ongoing => {}
-    }
-
-    let white = Color::White;
-    let black = Color::Black;
-
-    let mat = material_score_cfg(board, white, config) - material_score_cfg(board, black, config);
-    let res = reserve_score_cfg(board, white, config) - reserve_score_cfg(board, black, config);
-    let pst_val = pst_score(board, white) - pst_score(board, black);
-    let king = king_safety_cfg(board, white, config) - king_safety_cfg(board, black, config);
-    let mob = mobility_score(board, white) - mobility_score(board, black);
-    let pawns = pawn_structure(board, white) - pawn_structure(board, black);
-
-    let total = mat + res + pst_val + king + mob + pawns;
-
-    let sign = match board.side_to_move() {
-        Color::White => 1,
-        Color::Black => -1,
-    };
-    total * sign
+    evaluate_detailed(board, config).total
 }
 
 /// Material count using config piece values.
@@ -470,34 +451,6 @@ fn material_score_cfg(board: &Board, color: Color, config: &EngineConfig) -> i32
         score += count * config.piece_value(piece);
     }
     score
-}
-
-/// Reserve score using config piece values and reserve multipliers.
-fn reserve_score_cfg(board: &Board, color: Color, config: &EngineConfig) -> i32 {
-    let reserve = &board.reserves()[color.to_index()];
-    let mut score = 0;
-    for (piece, count) in reserve.iter() {
-        score += count as i32 * config.piece_value(piece) * config.reserve_multiplier_pct(piece) / 100;
-    }
-    score
-}
-
-/// King safety using config piece values for reserve amplifier.
-fn king_safety_cfg(board: &Board, color: Color, config: &EngineConfig) -> i32 {
-    // Delegate to the main king_safety but use config for the reserve amplifier
-    // The reserve amplifier scales with opponent reserve material
-    let base = king_safety_base(board, color);
-    let opponent = !color;
-    let opp_reserve_value = {
-        let reserve = &board.reserves()[opponent.to_index()];
-        let mut value = 0;
-        for (piece, count) in reserve.iter() {
-            value += count as i32 * config.piece_value(piece);
-        }
-        value
-    };
-    let amplifier = 100 + opp_reserve_value / 5;
-    base * amplifier / 100
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -643,14 +596,85 @@ mod tests {
         assert_eq!(piece_value(Piece::King), 0);
     }
 
+    /// Helper: value added by giving white the given reserve string, measured
+    /// as an eval delta on the same position (white to move).
+    fn reserve_delta(pos_without: &str, pos_with: &str, cfg: &EngineConfig) -> i32 {
+        let with: Board = pos_with.parse().unwrap();
+        let without: Board = pos_without.parse().unwrap();
+        evaluate_with_config(&with, cfg) - evaluate_with_config(&without, cfg)
+    }
+
+    #[test]
+    fn reserve_knight_worth_more_vs_exposed_king() {
+        // Same knight-in-hand, but against a castled black king stripped of
+        // its f7/g7/h7 shield: the attack bonus (plus the king-safety
+        // amplifier) must make the knight clearly more valuable than at
+        // startpos, where both kings are fully sheltered.
+        let cfg = EngineConfig::default();
+        let exposed_base = "rnbq1rk1/ppppp3/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQ - 0 1";
+        let exposed_with = "rnbq1rk1/ppppp3/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQ - 0 1";
+        let safe_base = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1";
+        let safe_with = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQkq - 0 1";
+
+        let delta_exposed = reserve_delta(exposed_base, exposed_with, &cfg);
+        let delta_safe = reserve_delta(safe_base, safe_with, &cfg);
+        assert!(
+            delta_exposed >= delta_safe + 100,
+            "knight in hand vs exposed king ({}) should be worth well more than vs safe king ({})",
+            delta_exposed, delta_safe
+        );
+    }
+
+    #[test]
+    fn reserve_pawn_worth_more_when_own_king_exposed() {
+        // White's castled king has lost its f2/g2/h2 shield: a pawn in hand
+        // (the blocking/shielding drop) should be worth more than at startpos.
+        let cfg = EngineConfig::default();
+        let exposed_base = "rnbqkbnr/pppppppp/8/8/8/8/PPPPP3/RNBQ1RK1[] w kq - 0 1";
+        let exposed_with = "rnbqkbnr/pppppppp/8/8/8/8/PPPPP3/RNBQ1RK1[P] w kq - 0 1";
+        let safe_base = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1";
+        let safe_with = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[P] w KQkq - 0 1";
+
+        let delta_exposed = reserve_delta(exposed_base, exposed_with, &cfg);
+        let delta_safe = reserve_delta(safe_base, safe_with, &cfg);
+        assert!(
+            delta_exposed >= delta_safe + 20,
+            "pawn in hand with exposed own king ({}) should be worth more than with safe king ({})",
+            delta_exposed, delta_safe
+        );
+    }
+
+    #[test]
+    fn zero_scales_restore_static_reserve_value() {
+        // With both scales at 0, the knight's value must not depend on the
+        // enemy king's exposure (amplifier effects act on the king-safety
+        // component, not the reserve component, and are isolated by comparing
+        // scale=0 against scale=default on the same positions).
+        let mut cfg_zero = EngineConfig::default();
+        cfg_zero.reserve_attack_scale = 0;
+        cfg_zero.reserve_defense_scale = 0;
+        let cfg_default = EngineConfig::default();
+
+        let exposed_base = "rnbq1rk1/ppppp3/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQ - 0 1";
+        let exposed_with = "rnbq1rk1/ppppp3/8/8/8/8/PPPPPPPP/RNBQKBNR[N] w KQ - 0 1";
+
+        let delta_default = reserve_delta(exposed_base, exposed_with, &cfg_default);
+        let delta_zero = reserve_delta(exposed_base, exposed_with, &cfg_zero);
+        assert!(
+            delta_default > delta_zero,
+            "attack scale should add value vs exposed king: default={}, zero={}",
+            delta_default, delta_zero
+        );
+    }
+
     #[test]
     fn reserve_multipliers_correct() {
-        assert_eq!(reserve_multiplier(Piece::Knight), 160);
-        assert_eq!(reserve_multiplier(Piece::Pawn), 130);
-        assert_eq!(reserve_multiplier(Piece::Bishop), 130);
-        assert_eq!(reserve_multiplier(Piece::Rook), 120);
-        assert_eq!(reserve_multiplier(Piece::Queen), 120);
-        assert_eq!(reserve_multiplier(Piece::King), 0);
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.reserve_multiplier_pct(Piece::Knight), 160);
+        assert_eq!(cfg.reserve_multiplier_pct(Piece::Pawn), 130);
+        assert_eq!(cfg.reserve_multiplier_pct(Piece::Bishop), 130);
+        assert_eq!(cfg.reserve_multiplier_pct(Piece::Rook), 120);
+        assert_eq!(cfg.reserve_multiplier_pct(Piece::Queen), 120);
     }
 
     #[test]
@@ -699,8 +723,9 @@ mod tests {
         let board = Board::default();
         // Both sides have same material: 8P + 2N + 2B + 2R + Q
         // = 800 + 640 + 660 + 1000 + 900 = 4000
-        let white_mat = material_score(&board, Color::White);
-        let black_mat = material_score(&board, Color::Black);
+        let cfg = EngineConfig::default();
+        let white_mat = material_score_cfg(&board, Color::White, &cfg);
+        let black_mat = material_score_cfg(&board, Color::Black, &cfg);
         assert_eq!(white_mat, black_mat);
         assert_eq!(white_mat, 8 * 100 + 2 * 320 + 2 * 330 + 2 * 500 + 900);
     }
@@ -835,8 +860,8 @@ mod tests {
                 .parse()
                 .unwrap();
         let shielded = Board::default();
-        let open_safety = king_safety(&open_king, Color::White);
-        let shielded_safety = king_safety(&shielded, Color::White);
+        let open_safety = king_safety_base(&open_king, Color::White);
+        let shielded_safety = king_safety_base(&shielded, Color::White);
         assert!(
             open_safety < shielded_safety,
             "open king file ({}) should have worse safety than shielded ({})",

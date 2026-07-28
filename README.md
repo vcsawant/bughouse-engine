@@ -59,7 +59,7 @@ cargo build --release          # → target/release/bughouse_engine
 # Run interactively (type UBI commands, Ctrl-D to exit)
 cargo run
 
-# Test (157 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, frozen positions, opening book, strategy, time, teammsg, config, pondering)
+# Test (171 unit tests covering protocol, state, evaluation, search, TT, quiescence, LMR, frozen positions, opening book, strategy, time, teammsg, config, pondering)
 cargo test
 ```
 
@@ -159,7 +159,7 @@ Replace random selection with a scored evaluation function and 1-ply search. The
 - `strategy.rs` — `PlayStyle` enum with 5 variants (Blitz, Standard, Extended, Slow, Instant); stub `determine_play_style()` always returns Blitz for Phase C
 - `scoring.rs` — static evaluation function (17 unit tests) with 7 components:
   - Material counting (P=100, N=320, B=330, R=500, Q=900)
-  - Reserve valuation at 70% discount
+  - Reserve valuation at a premium (pieces in hand are worth more than on-board; dynamic multipliers by king exposure)
   - Piece-square tables (midgame, per-piece type)
   - King safety: pawn shield, open files, attacker count, reserve amplifier
   - Mobility: piece attack squares (knights, bishops, rooks, queens)
@@ -241,7 +241,7 @@ The engine understands it's playing bughouse, not just two independent chess gam
 
 **Tunable parameters via `setoption`:**
 
-All strategy, time, evaluation, and search parameters are configurable at runtime via UBI `setoption` commands. 29 parameters across four categories:
+All strategy, time, evaluation, and search parameters are configurable at runtime via UBI `setoption` commands. 32 parameters across four categories:
 
 | Category | Examples |
 |----------|---------|
@@ -249,8 +249,15 @@ All strategy, time, evaluation, and search parameters are configurable at runtim
 | Time budget | `BlitzDivisor`, `StandardCap`, `ExtendedDivisor` |
 | Piece values & reserves | `PawnValue`, `KnightValue`, `KnightReservePct` |
 | Search | `QsCheckDropDepth` (checking drops in quiescence: 0 = off, default 1) |
+| Dynamic reserves | `ReserveAttackScale`, `ReserveDefenseScale`, `ReserveDynamicCap` |
 
 Example: `setoption name BlitzStyleFactor value 0.7`
+
+**E5 — Dynamic reserve valuation (complete):**
+- Reserve multipliers adjust to king exposure: non-pawn pieces gain up to `ReserveDynamicCap` percentage points as the *enemy* king grows exposed (drop-attack ammunition); pawns gain points as *our* king grows exposed (the premier shielding/blocking drop)
+- Exposure = the raw king-safety penalty (shield, open files, attacked zone) before the reserve amplifier; both effects share one computation
+- All three coefficients are `setoption`-tunable; scale 0 restores static multipliers
+- Single evaluation code path: `evaluate` and `evaluate_with_config` both delegate to `evaluate_detailed(board, config)`, so eval variants cannot diverge
 
 **Remaining deliverables (E4, E6):**
 - Stall detection: expected value of waiting (P × reserve_impact) vs cost of stalling
