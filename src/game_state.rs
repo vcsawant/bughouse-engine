@@ -241,6 +241,11 @@ impl EngineState {
             handle.send(EvalCommand::Quit);
         }
         self.eval_handles = [engine::spawn_eval_thread(), engine::spawn_eval_thread()];
+        // Fresh threads start with a default config — push the current one so
+        // options set before `ubinewgame` survive the reset.
+        for handle in &self.eval_handles {
+            handle.send(EvalCommand::UpdateConfig(self.config.clone()));
+        }
         self.partner_state = PartnerState::default();
         self.move_count = [0; 2];
         self.total_depth = [0; 2];
