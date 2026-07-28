@@ -263,9 +263,11 @@ fn king_safety(board: &Board, color: Color) -> i32 {
     let penalty = king_safety_base(board, color);
     if penalty >= 0 { return penalty; }
 
-    // (d) Reserve amplifier: scale penalty by opponent's reserve value
+    // (d) Reserve amplifier: scale penalty by opponent's reserve value.
+    // Same formula as king_safety_cfg: 1 + reserve_value/500.
     let opp_reserve_val = reserve_material_value(board, !color);
-    penalty * (1000 + opp_reserve_val) / 1000
+    let amplifier = 100 + opp_reserve_val / 5;
+    penalty * amplifier / 100
 }
 
 /// Mobility score for one color.
